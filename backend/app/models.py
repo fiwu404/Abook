@@ -12,6 +12,25 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20))
 
 
+class ModelProvider(Base):
+    __tablename__ = "model_providers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(100), unique=True)
+    base_url: Mapped[str] = mapped_column(String(500))
+    api_style: Mapped[str] = mapped_column(String(20))
+    api_key_cipher: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[object] = mapped_column(DateTime, default=now)
+
+
+class AISettings(Base):
+    __tablename__ = "ai_settings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text_provider_id: Mapped[int | None] = mapped_column(ForeignKey("model_providers.id"), nullable=True)
+    text_model: Mapped[str] = mapped_column(String(200), default="")
+    vision_provider_id: Mapped[int | None] = mapped_column(ForeignKey("model_providers.id"), nullable=True)
+    vision_model: Mapped[str] = mapped_column(String(200), default="")
+
+
 class Book(Base):
     __tablename__ = "books"
     id: Mapped[int] = mapped_column(primary_key=True)

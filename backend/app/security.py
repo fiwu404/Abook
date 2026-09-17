@@ -65,11 +65,12 @@ def roles(*allowed):
 
 
 def bootstrap(db: Session):
-    for role, name_var, pass_var, default_name in [
-        ("operator", "OPERATOR_USER", "OPERATOR_PASSWORD", "operator"),
-        ("reviewer", "REVIEWER_USER", "REVIEWER_PASSWORD", "reviewer"),
-    ]:
-        name, password = os.getenv(name_var, default_name), os.getenv(pass_var, "")
-        if password and not db.scalar(select(User).where(User.username == name)):
-            db.add(User(username=name, password_hash=hash_password(password), role=role))
+    name, password = os.getenv("ADMIN_USER", "admin"), os.getenv("ADMIN_PASSWORD", "")
+    if not password:
+        raise RuntimeError("请设置 ADMIN_PASSWORD")
+    existing = db.scalar(select(User).where(User.username == name))
+    if existing and existing.role != "admin":
+        raise RuntimeError("ADMIN_USER 已被其他角色占用，请修改该配置")
+    if not existing:
+        db.add(User(username=name, password_hash=hash_password(password), role="admin"))
     db.commit()

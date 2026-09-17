@@ -1,10 +1,12 @@
 """One real HTTP path through the manual fallback and reviewed exam flow."""
 import io
+import json
 import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
 
+import httpx
 import pymupdf
 from fastapi.testclient import TestClient
 
@@ -13,12 +15,12 @@ tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_URL"] = "sqlite:///" + str(Path(tmp.name) / "test.db")
 os.environ["UPLOAD_DIR"] = str(Path(tmp.name) / "uploads")
 os.environ["APP_SECRET"] = "test-secret-abcdefghijklmnopqrstuvwxyz-12345"
-os.environ["OPERATOR_PASSWORD"] = "operator1234"
-os.environ["REVIEWER_PASSWORD"] = "reviewer1234"
+os.environ["ADMIN_PASSWORD"] = "admin12345678"
 
 from app.db import now  # noqa: E402
 from app.main import app  # noqa: E402
 from app.tasks import celery_app  # noqa: E402
+from app import ai  # noqa: E402
 
 
 celery_app.conf.task_always_eager = True
@@ -42,11 +44,19 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
     body = pdf.tobytes()
     pdf.close()
     with TestClient(app) as client:
-        operator = headers(client, "operator", "operator1234")
-        reviewer = headers(client, "reviewer", "reviewer1234")
-        student = {"Authorization": "Bearer " + ok(client.post("/api/auth/register", json={"username": "student_one", "password": "student1234"}))["token"]}
+        operator = headers(client, "admin", "admin12345678")
+        reviewer = operator
+        assert client.post("/api/auth/register", json={"username": "other", "password": "student1234"}).status_code == 404
+        ok(client.post("/api/users", headers=operator, json={"username": "student_one", "password": "student1234", "role": "student"}))
+        ok(client.post("/api/users", headers=operator, json={"username": "teacher_one", "password": "teacher1234", "role": "teacher"}))
+        assert len(ok(client.get("/api/users", headers=operator))) == 3
+        student = headers(client, "student_one", "student1234")
+        teacher = headers(client, "teacher_one", "teacher1234")
+        assert client.get("/api/users", headers=teacher).status_code == 403
         book = ok(client.post("/api/books?title=Biology&version=1", headers=operator,
                               files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")}))
+        assert client.post("/api/books?title=Other&version=1", headers=teacher,
+                           files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")}).status_code == 403
         assert book["version"] == "1"
         job = ok(client.post(f"/api/books/{book['id']}/parse", headers=operator))
         assert ok(client.get("/api/jobs", headers=operator))[0]["status"] == "done"
@@ -54,6 +64,7 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         assert len(pages) == 1
         ok(client.post(f"/api/books/{book['id']}/confirm-mapping", headers=operator))
         section = ok(client.get(f"/api/books/{book['id']}/learning", headers=student))["sections"][0]
+        assert ok(client.get(f"/api/books/{book['id']}/learning", headers=teacher))["sections"]
         quote = "Photosynthesis converts sunlight into chemical energy"
         knowledge = ok(client.post(f"/api/books/{book['id']}/knowledge", headers=operator, json={
             "title": "Photosynthesis", "content": "Plants convert sunlight to chemical energy.",
@@ -73,6 +84,13 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         end = now() + timedelta(minutes=30)
         ok(client.post(f"/api/papers/{paper['id']}/publish", headers=operator,
                        json={"starts_at": start.isoformat(), "ends_at": end.isoformat()}))
+        assert "snapshot" not in ok(client.get(f"/api/papers/{paper['id']}", headers=teacher))
+        assert client.post(f"/api/papers/{paper['id']}/start", headers=teacher).status_code == 403
+        admin_attempt = ok(client.post(f"/api/papers/{paper['id']}/start", headers=operator))
+        assert "answer" not in admin_attempt["questions"][0]
+        ok(client.put(f"/api/attempts/{admin_attempt['id']}/answer", headers=operator,
+                      json={"question_id": question["id"], "answer": "A"}))
+        assert ok(client.post(f"/api/attempts/{admin_attempt['id']}/submit", headers=operator))["score"] == 10
         student_paper = ok(client.get(f"/api/papers/{paper['id']}", headers=student))
         assert "snapshot" not in student_paper
         attempt = ok(client.post(f"/api/papers/{paper['id']}/start", headers=student))
@@ -109,3 +127,42 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         assert changed["status"] == "needs_review"
         old_exam = ok(client.get(f"/api/attempts/{attempt['id']}", headers=student))
         assert old_exam["result"][0]["evidence"] == quote
+
+
+def test_cloud_provider_models_selection_and_vision(monkeypatch):
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers.get("Authorization") == "Bearer test-cloud-key"
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "cloud-vl"}, {"id": "cloud-text"}]})
+        assert request.url.path == "/v1/chat/completions"
+        payload = json.loads(request.content)
+        assert payload["model"] in {"cloud-vl", "cloud-text"}
+        if payload.get("response_format"):
+            return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "TEST 123"}}]})
+
+    monkeypatch.setattr(ai, "_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(respond), timeout=timeout))
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        ok(client.post("/api/users", headers=admin, json={"username": "teacher_model", "password": "teacher1234", "role": "teacher"}))
+        teacher = headers(client, "teacher_model", "teacher1234")
+        assert client.get("/api/providers", headers=teacher).status_code == 403
+        created = ok(client.post("/api/providers", headers=admin, json={
+            "display_name": "云端视觉", "base_url": "https://example.test/v1", "api_style": "openai",
+            "api_key": "test-cloud-key"}))
+        assert created["has_api_key"] is True
+        listed = ok(client.get("/api/providers", headers=admin))
+        assert "test-cloud-key" not in str(listed) and "api_key_cipher" not in str(listed)
+        assert ok(client.get(f"/api/providers/{created['id']}/models", headers=admin))["models"] == ["cloud-text", "cloud-vl"]
+        assert ok(client.post(f"/api/providers/{created['id']}/test", headers=admin,
+                              json={"model": "cloud-vl", "vision": True}))["ok"] is True
+        config = ok(client.put("/api/ai/config", headers=admin, json={
+            "text_provider_id": created["id"], "text_model": "cloud-text",
+            "vision_provider_id": created["id"], "vision_model": "cloud-vl"}))
+        assert config["vision_model"] == "cloud-vl"
+        assert ai.structured("test") == {"ok": True}
+        assert ai.ocr_png(b"png") == "TEST 123"
+        assert any(b"image_url" in request.content for request in requests)

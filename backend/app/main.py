@@ -13,8 +13,10 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .ai import (config_view, encrypt_key, list_models, provider_view, seed_ai_settings,
+                 test_model, validate_base_url)
 from .db import Base, SessionLocal, engine, get_db, now
-from .models import Attempt, Audit, Book, Chunk, Job, Knowledge, Page, Paper, Practice, Question, User
+from .models import AISettings, Attempt, Audit, Book, Chunk, Job, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
 from .security import bootstrap, check_password, current_user, hash_password, issue_token, roles
 from .services import audit, page_issues, question_public, question_snapshot, rebuild_chunks, validate_question
 from .tasks import run_job
@@ -28,6 +30,7 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         bootstrap(db)
+        seed_ai_settings(db)
     yield
 
 
@@ -86,24 +89,38 @@ class Credentials(BaseModel):
     password: str
 
 
-@app.post("/api/auth/register")
-def register(data: Credentials, db: Session = Depends(get_db)):
+class NewUser(Credentials):
+    role: str
+
+
+@app.post("/api/users")
+def create_user(data: NewUser, actor: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     if not re.fullmatch(r"[A-Za-z0-9_]{3,40}", data.username) or len(data.password) < 8:
         raise HTTPException(400, "用户名须为 3-40 位字母、数字或下划线，密码至少 8 位")
-    user = User(username=data.username, password_hash=hash_password(data.password), role="student")
+    if data.role not in {"teacher", "student"}:
+        raise HTTPException(400, "仅可创建教师或学生账号")
+    user = User(username=data.username, password_hash=hash_password(data.password), role=data.role)
     db.add(user)
     try:
+        db.flush()
+        audit(db, "user", user.id, actor.id, "create", after={"username": user.username, "role": user.role})
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "用户名已存在")
-    return {"token": issue_token(user), "user": {"id": user.id, "username": user.username, "role": user.role}}
+    return {"id": user.id, "username": user.username, "role": user.role}
+
+
+@app.get("/api/users")
+def list_users(actor: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    return [{"id": user.id, "username": user.username, "role": user.role}
+            for user in db.scalars(select(User).order_by(User.id)).all()]
 
 
 @app.post("/api/auth/login")
 def login(data: Credentials, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.username == data.username))
-    if not user or not check_password(data.password, user.password_hash):
+    if not user or user.role not in {"admin", "teacher", "student"} or not check_password(data.password, user.password_hash):
         raise HTTPException(401, "用户名或密码错误")
     return {"token": issue_token(user), "user": {"id": user.id, "username": user.username, "role": user.role}}
 
@@ -118,9 +135,130 @@ def health():
     return {"ok": True}
 
 
+@app.get("/api/ai/status")
+def ai_status(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    config = config_view(db)
+    providers = {provider.id: provider for provider in db.scalars(select(ModelProvider)).all()}
+    details = {}
+    for kind in ("text", "vision"):
+        provider = providers.get(config[f"{kind}_provider_id"])
+        details[kind] = {"provider": provider.display_name if provider else "", "model": config[f"{kind}_model"],
+                         "base_url": provider.base_url if provider else ""}
+    return details
+
+
+class ProviderInput(BaseModel):
+    display_name: str = Field(min_length=1, max_length=100)
+    base_url: str = Field(min_length=1, max_length=500)
+    api_style: str = "openai"
+    api_key: str = ""
+
+
+def provider_data(data: ProviderInput):
+    if data.api_style not in {"ollama", "openai"}:
+        raise HTTPException(400, "接口类型仅支持 Ollama 或 OpenAI 兼容")
+    try:
+        base_url = validate_base_url(data.base_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not data.display_name.strip():
+        raise HTTPException(400, "显示名称不能为空")
+    return base_url
+
+
+@app.get("/api/providers")
+def providers(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    return [provider_view(p) for p in db.scalars(select(ModelProvider).order_by(ModelProvider.id)).all()]
+
+
+@app.post("/api/providers")
+def create_provider(data: ProviderInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    base_url = provider_data(data)
+    provider = ModelProvider(display_name=data.display_name.strip(), base_url=base_url, api_style=data.api_style,
+                             api_key_cipher=encrypt_key(data.api_key) if data.api_key else None)
+    db.add(provider)
+    try:
+        db.flush()
+        audit(db, "provider", provider.id, user.id, "create", after=provider_view(provider))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "提供商显示名称已存在")
+    return provider_view(provider)
+
+
+@app.put("/api/providers/{provider_id}")
+def update_provider(provider_id: int, data: ProviderInput, user: User = Depends(roles("admin")),
+                    db: Session = Depends(get_db)):
+    provider = require(db.get(ModelProvider, provider_id))
+    base_url = provider_data(data)
+    before = provider_view(provider)
+    provider.display_name, provider.base_url, provider.api_style = data.display_name.strip(), base_url, data.api_style
+    if data.api_key:
+        provider.api_key_cipher = encrypt_key(data.api_key)
+    try:
+        audit(db, "provider", provider.id, user.id, "edit", before, provider_view(provider))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "提供商显示名称已存在")
+    return provider_view(provider)
+
+
+@app.get("/api/providers/{provider_id}/models")
+def provider_models(provider_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    provider = require(db.get(ModelProvider, provider_id))
+    try:
+        return {"models": list_models(provider)}
+    except Exception as exc:
+        raise HTTPException(502, f"获取模型列表失败：{str(exc)[:300]}") from exc
+
+
+class ModelTest(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+    vision: bool = False
+
+
+@app.post("/api/providers/{provider_id}/test")
+def check_model(provider_id: int, data: ModelTest, user: User = Depends(roles("admin")),
+                db: Session = Depends(get_db)):
+    provider = require(db.get(ModelProvider, provider_id))
+    try:
+        return test_model(provider, data.model, data.vision)
+    except Exception as exc:
+        raise HTTPException(502, f"模型测试失败：{str(exc)[:300]}") from exc
+
+
+@app.get("/api/ai/config")
+def get_ai_config(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    return config_view(db)
+
+
+class AIConfigInput(BaseModel):
+    text_provider_id: int
+    text_model: str = Field(min_length=1, max_length=200)
+    vision_provider_id: int
+    vision_model: str = Field(min_length=1, max_length=200)
+
+
+@app.put("/api/ai/config")
+def update_ai_config(data: AIConfigInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    for provider_id in {data.text_provider_id, data.vision_provider_id}:
+        require(db.get(ModelProvider, provider_id), "提供商不存在")
+    settings = require(db.get(AISettings, 1))
+    before = config_view(db)
+    settings.text_provider_id, settings.text_model = data.text_provider_id, data.text_model.strip()
+    settings.vision_provider_id, settings.vision_model = data.vision_provider_id, data.vision_model.strip()
+    if not settings.text_model or not settings.vision_model:
+        raise HTTPException(400, "请选择文本模型和视觉模型")
+    audit(db, "ai_config", 1, user.id, "edit", before, config_view(db))
+    db.commit()
+    return config_view(db)
+
+
 @app.post("/api/books")
 async def upload_book(title: str, version: str, file: UploadFile = File(...),
-                      user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+                      user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "第一版仅支持 PDF")
     if not title.strip() or not version.strip():
@@ -145,7 +283,7 @@ async def upload_book(title: str, version: str, file: UploadFile = File(...),
 @app.get("/api/books")
 def books(user: User = Depends(current_user), db: Session = Depends(get_db)):
     query = select(Book).order_by(Book.id.desc())
-    if user.role == "student":
+    if user.role != "admin":
         query = query.where(Book.mapping_confirmed.is_(True))
     return [book_view(book) for book in db.scalars(query).all()]
 
@@ -153,19 +291,19 @@ def books(user: User = Depends(current_user), db: Session = Depends(get_db)):
 @app.get("/api/books/{book_id}")
 def book_detail(book_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
-    if user.role == "student" and not book.mapping_confirmed:
+    if user.role != "admin" and not book.mapping_confirmed:
         raise HTTPException(404, "教材不存在")
     return book_view(book)
 
 
 @app.post("/api/books/{book_id}/parse")
-def parse_book(book_id: int, user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def parse_book(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
     return out(enqueue(db, "parse", book.id, f"parse:{book.id}:{book.sha256}"))
 
 
 @app.get("/api/books/{book_id}/pages")
-def pages(book_id: int, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def pages(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     require(db.get(Book, book_id))
     return out(db.scalars(select(Page).where(Page.book_id == book_id).order_by(Page.pdf_page)).all())
 
@@ -184,7 +322,7 @@ class TocItem(BaseModel):
 
 
 @app.put("/api/books/{book_id}/toc")
-def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
     if any(item.pdf_page > book.page_count or not item.title.strip() for item in items):
         raise HTTPException(400, "书签页码或标题无效")
@@ -203,7 +341,7 @@ def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("ope
 
 
 @app.patch("/api/pages/{page_id}")
-def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     page = require(db.get(Page, page_id))
     book = require(db.get(Book, page.book_id))
     before = out(page)
@@ -218,7 +356,7 @@ def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("operator
 
 
 @app.post("/api/books/{book_id}/confirm-mapping")
-def confirm_mapping(book_id: int, user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def confirm_mapping(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
     pages = db.scalars(select(Page).where(Page.book_id == book_id).order_by(Page.pdf_page)).all()
     if not pages or len(pages) != book.page_count:
@@ -259,12 +397,12 @@ def learning(book_id: int, user: User = Depends(current_user), db: Session = Dep
 
 
 @app.get("/api/jobs")
-def jobs(user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def jobs(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     return out(db.scalars(select(Job).order_by(Job.id.desc()).limit(50)).all())
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: int, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def cancel_job(job_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     job = require(db.get(Job, job_id))
     if job.status in ("queued", "running", "retrying"):
         job.cancel_requested = True
@@ -275,7 +413,7 @@ def cancel_job(job_id: int, user: User = Depends(roles("operator", "reviewer")),
 
 
 @app.post("/api/jobs/{job_id}/retry")
-def retry_job(job_id: int, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def retry_job(job_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     job = require(db.get(Job, job_id))
     if job.status not in ("failed", "cancelled"):
         raise HTTPException(400, "只能重试失败或已取消的任务")
@@ -283,7 +421,7 @@ def retry_job(job_id: int, user: User = Depends(roles("operator", "reviewer")), 
 
 
 @app.post("/api/books/{book_id}/extract-knowledge")
-def extract_knowledge(book_id: int, user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def extract_knowledge(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
     if not book.mapping_confirmed:
         raise HTTPException(400, "请先确认目录与页码")
@@ -292,7 +430,7 @@ def extract_knowledge(book_id: int, user: User = Depends(roles("operator")), db:
 
 
 @app.get("/api/books/{book_id}/knowledge")
-def list_knowledge(book_id: int, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def list_knowledge(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     require(db.get(Book, book_id))
     return out(db.scalars(select(Knowledge).where(Knowledge.book_id == book_id).order_by(Knowledge.id.desc())).all())
 
@@ -306,7 +444,7 @@ class KnowledgeInput(BaseModel):
 
 
 @app.post("/api/books/{book_id}/knowledge")
-def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
     chunk = db.get(Chunk, data.chunk_id) if data.chunk_id else None
     if chunk and (chunk.book_id != book.id or not chunk.active):
@@ -323,7 +461,7 @@ def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(ro
 
 
 @app.patch("/api/knowledge/{knowledge_id}")
-def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     item = require(db.get(Knowledge, knowledge_id))
     before = out(item)
     chunk = db.get(Chunk, data.chunk_id) if data.chunk_id else None
@@ -345,7 +483,7 @@ class ReviewInput(BaseModel):
 
 
 @app.post("/api/knowledge/{knowledge_id}/review")
-def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(roles("reviewer")), db: Session = Depends(get_db)):
+def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     item = require(db.get(Knowledge, knowledge_id))
     if data.approve and item.chunk_id:
         chunk = db.get(Chunk, item.chunk_id)
@@ -361,7 +499,7 @@ def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(
 
 
 @app.post("/api/knowledge/{knowledge_id}/generate-question")
-def generate_question(knowledge_id: int, user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def generate_question(knowledge_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     item = require(db.get(Knowledge, knowledge_id))
     if item.status != "approved" or not item.chunk_id:
         raise HTTPException(400, "只有已审核且有教材出处的知识点可以出题")
@@ -381,13 +519,13 @@ class QuestionInput(BaseModel):
 
 
 @app.get("/api/questions")
-def questions(book_id: int, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def questions(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     ids = select(Knowledge.id).where(Knowledge.book_id == book_id)
     return out(db.scalars(select(Question).where(Question.knowledge_id.in_(ids)).order_by(Question.id.desc())).all())
 
 
 @app.post("/api/questions")
-def create_question(data: QuestionInput, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def create_question(data: QuestionInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     knowledge = require(db.get(Knowledge, data.knowledge_id))
     if not knowledge.chunk_id:
         raise HTTPException(400, "题目必须绑定教材原文")
@@ -403,7 +541,7 @@ def create_question(data: QuestionInput, user: User = Depends(roles("operator", 
 
 
 @app.patch("/api/questions/{question_id}")
-def edit_question(question_id: int, data: QuestionInput, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def edit_question(question_id: int, data: QuestionInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
     knowledge = require(db.get(Knowledge, data.knowledge_id))
     if not knowledge.chunk_id:
@@ -419,7 +557,7 @@ def edit_question(question_id: int, data: QuestionInput, user: User = Depends(ro
 
 
 @app.post("/api/questions/{question_id}/validate")
-def revalidate(question_id: int, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def revalidate(question_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
     question.validation = validate_question(db, question)
     db.commit()
@@ -427,7 +565,7 @@ def revalidate(question_id: int, user: User = Depends(roles("operator", "reviewe
 
 
 @app.post("/api/questions/{question_id}/review")
-def review_question(question_id: int, data: ReviewInput, user: User = Depends(roles("reviewer")), db: Session = Depends(get_db)):
+def review_question(question_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
     before = out(question)
     question.validation = validate_question(db, question)
@@ -449,7 +587,7 @@ class PaperInput(BaseModel):
 
 
 @app.post("/api/papers")
-def create_paper(data: PaperInput, user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def create_paper(data: PaperInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     require(db.get(Book, data.book_id))
     allowed_ids = set(db.scalars(select(Knowledge.id).where(Knowledge.book_id == data.book_id, Knowledge.status == "approved")).all())
     if not data.knowledge_ids or not set(data.knowledge_ids).issubset(allowed_ids):
@@ -483,10 +621,10 @@ def create_paper(data: PaperInput, user: User = Depends(roles("operator")), db: 
 @app.get("/api/papers")
 def papers(user: User = Depends(current_user), db: Session = Depends(get_db)):
     query = select(Paper).order_by(Paper.id.desc())
-    if user.role == "student":
+    if user.role != "admin":
         query = query.where(Paper.status == "published")
     result = out(db.scalars(query).all())
-    if user.role == "student":
+    if user.role != "admin":
         for paper in result:
             paper.pop("snapshot", None)
             paper.pop("rule", None)
@@ -496,7 +634,7 @@ def papers(user: User = Depends(current_user), db: Session = Depends(get_db)):
 @app.get("/api/papers/{paper_id}")
 def paper_detail(paper_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     paper = require(db.get(Paper, paper_id))
-    if user.role == "student":
+    if user.role != "admin":
         if paper.status != "published":
             raise HTTPException(404, "试卷不存在")
         return {"id": paper.id, "title": paper.title, "total_score": paper.total_score,
@@ -510,7 +648,7 @@ class PublishInput(BaseModel):
 
 
 @app.post("/api/papers/{paper_id}/publish")
-def publish(paper_id: int, data: PublishInput, user: User = Depends(roles("operator")), db: Session = Depends(get_db)):
+def publish(paper_id: int, data: PublishInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     paper = require(db.get(Paper, paper_id))
     if paper.status != "draft":
         raise HTTPException(400, "试卷已经发布")
@@ -548,7 +686,7 @@ def grade(db: Session, attempt: Attempt, paper: Paper):
 
 
 @app.post("/api/papers/{paper_id}/start")
-def start_exam(paper_id: int, user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def start_exam(paper_id: int, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     paper = require(db.get(Paper, paper_id))
     if paper.status != "published":
         raise HTTPException(400, "考试尚未发布")
@@ -586,7 +724,7 @@ class AnswerInput(BaseModel):
 
 
 @app.put("/api/attempts/{attempt_id}/answer")
-def save_answer(attempt_id: int, data: AnswerInput, user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def save_answer(attempt_id: int, data: AnswerInput, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     attempt = require(db.scalar(select(Attempt).where(Attempt.id == attempt_id).with_for_update()))
     paper = db.get(Paper, attempt.paper_id)
     if attempt.user_id != user.id:
@@ -603,7 +741,7 @@ def save_answer(attempt_id: int, data: AnswerInput, user: User = Depends(roles("
 
 
 @app.post("/api/attempts/{attempt_id}/submit")
-def submit(attempt_id: int, user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def submit(attempt_id: int, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     attempt = require(db.scalar(select(Attempt).where(Attempt.id == attempt_id).with_for_update()))
     if attempt.user_id != user.id:
         raise HTTPException(403, "无权访问")
@@ -614,7 +752,7 @@ def submit(attempt_id: int, user: User = Depends(roles("student")), db: Session 
 @app.get("/api/attempts/{attempt_id}")
 def attempt_detail(attempt_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     attempt = require(db.get(Attempt, attempt_id))
-    if user.role == "student" and attempt.user_id != user.id:
+    if user.role != "admin" and attempt.user_id != user.id:
         raise HTTPException(403, "无权访问")
     paper = db.get(Paper, attempt.paper_id)
     if not attempt.submitted_at and now() >= paper.ends_at:
@@ -625,7 +763,7 @@ def attempt_detail(attempt_id: int, user: User = Depends(current_user), db: Sess
 
 
 @app.get("/api/my/attempts")
-def my_attempts(user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def my_attempts(user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     attempts = db.scalars(select(Attempt).where(Attempt.user_id == user.id).order_by(Attempt.id.desc())).all()
     for attempt in attempts:
         paper = db.get(Paper, attempt.paper_id)
@@ -635,7 +773,7 @@ def my_attempts(user: User = Depends(roles("student")), db: Session = Depends(ge
 
 
 @app.get("/api/my/mastery")
-def mastery(user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def mastery(user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     result = {}
     for attempt in db.scalars(select(Attempt).where(Attempt.user_id == user.id, Attempt.submitted_at.is_not(None))).all():
         for row in attempt.result:
@@ -647,7 +785,7 @@ def mastery(user: User = Depends(roles("student")), db: Session = Depends(get_db
 
 
 @app.get("/api/my/variant-requests")
-def variant_requests(user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def variant_requests(user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     jobs = db.scalars(select(Job).where(Job.key.like(f"variant:%:{user.id}")).order_by(Job.id.desc())).all()
     result = []
     for job in jobs:
@@ -665,7 +803,7 @@ class PracticeInput(BaseModel):
 
 
 @app.post("/api/practices")
-def create_practice(data: PracticeInput, user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def create_practice(data: PracticeInput, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     attempt = require(db.get(Attempt, data.source_attempt_id))
     if attempt.user_id != user.id or not attempt.submitted_at:
         raise HTTPException(403, "只能练习自己的已交卷错题")
@@ -696,7 +834,7 @@ class PracticeAnswer(BaseModel):
 
 
 @app.post("/api/practices/{practice_id}/answer")
-def answer_practice(practice_id: int, data: PracticeAnswer, user: User = Depends(roles("student")), db: Session = Depends(get_db)):
+def answer_practice(practice_id: int, data: PracticeAnswer, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
     practice = require(db.get(Practice, practice_id))
     if practice.user_id != user.id:
         raise HTTPException(403, "无权访问")
@@ -711,5 +849,5 @@ def answer_practice(practice_id: int, data: PracticeAnswer, user: User = Depends
 
 
 @app.get("/api/audits")
-def audits(entity: str, entity_id: int, user: User = Depends(roles("operator", "reviewer")), db: Session = Depends(get_db)):
+def audits(entity: str, entity_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     return out(db.scalars(select(Audit).where(Audit.entity == entity, Audit.entity_id == entity_id).order_by(Audit.id.desc())).all())
