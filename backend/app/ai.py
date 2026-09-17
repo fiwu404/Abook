@@ -116,10 +116,18 @@ def _request(provider: ModelProvider, model: str, messages: list[dict], json_mod
         payload["response_format"] = {"type": "json_object"}
     with _client(timeout) as client:
         response = client.post(base + "/chat/completions", headers=headers, json=payload)
-        if json_mode and response.status_code in {400, 422}:
+        # Ollama may return 500 when its JSON grammar parser rejects a vision
+        # model's OCR-style reply. Retry once without the forced format.
+        if json_mode and (response.status_code in {400, 422} or
+                          provider.api_style == "ollama" and response.status_code == 500):
             payload.pop("response_format")
             response = client.post(base + "/chat/completions", headers=headers, json=payload)
-        response.raise_for_status()
+        if response.is_error:
+            try:
+                detail = response.json().get("error", response.text)
+            except (ValueError, AttributeError):
+                detail = response.text
+            raise RuntimeError(f"{provider.display_name} / {model} 返回 HTTP {response.status_code}：{str(detail)[:400]}")
         message = response.json()["choices"][0]["message"]
     content = message.get("content") or message.get("reasoning") or message.get("thinking")
     if isinstance(content, list):
@@ -127,6 +135,23 @@ def _request(provider: ModelProvider, model: str, messages: list[dict], json_mod
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("模型未返回正文，请检查模型输出和推理配置")
     return content.strip()
+
+
+def _json_object(raw: str) -> dict:
+    cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        if start < 0:
+            raise ValueError("模型没有返回 JSON 对象") from None
+        try:
+            value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+        except json.JSONDecodeError as exc:
+            raise ValueError("模型返回的 JSON 无法解析") from exc
+    if not isinstance(value, dict):
+        raise ValueError("模型没有返回 JSON 对象")
+    return value
 
 
 def _selected(kind: str) -> tuple[ModelProvider, str]:
@@ -147,8 +172,7 @@ def structured(prompt: str) -> dict:
         {"role": "system", "content": "你是严谨的教材编辑。只返回 JSON，不要 Markdown。所有依据必须逐字来自输入原文。"},
         {"role": "user", "content": prompt},
     ], json_mode=True)
-    raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(raw)
+    return _json_object(raw)
 
 
 def ocr_png(png: bytes) -> str:
@@ -167,8 +191,12 @@ def vision_json(png: bytes, prompt: str) -> dict:
         {"type": "text", "text": prompt + " 只返回 JSON，不要 Markdown。"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}},
     ]}], json_mode=True)
-    raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(raw)
+    try:
+        return _json_object(raw)
+    except ValueError:
+        # A vision model may return the page transcription instead of the
+        # requested JSON. The caller can still use visible headings from it.
+        return {"raw_text": raw[:10000]}
 
 
 def test_model(provider: ModelProvider, model: str, vision: bool = False) -> dict:
@@ -180,10 +208,12 @@ def test_model(provider: ModelProvider, model: str, vision: bool = False) -> dic
         page.insert_text((12, 40), "TEST 123", fontsize=18)
         png = page.get_pixmap().tobytes("png")
         document.close()
-        content = [{"type": "text", "text": "请简短读出图中的文字。"},
+        content = [{"type": "text", "text": "读出图中文字，只返回 JSON：{\"text\":\"识别出的文字\"}。"},
                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}}]
     else:
         content = "请只回复 OK。"
     start = time.monotonic()
-    reply = _request(provider, model, [{"role": "user", "content": content}], timeout=60)
+    reply = _request(provider, model, [{"role": "user", "content": content}], json_mode=vision, timeout=60)
+    if vision:
+        _json_object(reply)
     return {"ok": True, "latency_ms": round((time.monotonic() - start) * 1000), "reply": reply[:160]}

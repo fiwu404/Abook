@@ -5,6 +5,7 @@ import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pymupdf
@@ -19,10 +20,10 @@ os.environ["ADMIN_PASSWORD"] = "admin12345678"
 
 from app.db import SessionLocal, now  # noqa: E402
 from app.main import app  # noqa: E402
-from app.tasks import celery_app  # noqa: E402
+from app.tasks import _knowledge_batches, _source_weight, _verbatim_quote, celery_app  # noqa: E402
 from app import ai  # noqa: E402
 from app.catalog import chapter_entries, expand_heading_indices, parse_toc_text  # noqa: E402
-from app.models import BookCatalog, Page  # noqa: E402
+from app.models import BookCatalog, ModelProvider, Page, Paper  # noqa: E402
 
 
 celery_app.conf.task_always_eager = True
@@ -37,6 +38,20 @@ def ok(response, code=200):
 def headers(client, username, password):
     token = ok(client.post("/api/auth/login", json={"username": username, "password": password}))["token"]
     return {"Authorization": "Bearer " + token}
+
+
+def test_detailed_knowledge_batches_keep_heading_and_source():
+    chunks = [SimpleNamespace(id=1, text="定义：资源池。\n组成：计算、存储。"),
+              SimpleNamespace(id=2, text="原理：" + "按需分配。" * 450),
+              SimpleNamespace(id=3, text="分类：公有云和私有云。")]
+    batches = _knowledge_batches(chunks, {1: 4, 2: 4, 3: 5})
+    assert len(batches) >= 3
+    assert batches[-1][0] == 5
+    assert all({4 if chunk.id < 3 else 5 for chunk, _ in group} == {heading}
+               for heading, group in batches)
+    assert all(sum(_source_weight(part) for _, part in group) <= 3200 for _, group in batches)
+    assert _verbatim_quote("计算\n 资源池", "计算资源池") == "计算\n 资源池"
+    assert _verbatim_quote("计算资源池", "虚构知识") == ""
 
 
 def test_reviewed_exam_and_invalidation(monkeypatch):
@@ -91,6 +106,17 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         end = now() + timedelta(minutes=30)
         ok(client.post(f"/api/papers/{paper['id']}/publish", headers=operator,
                        json={"starts_at": start.isoformat(), "ends_at": end.isoformat()}))
+        assert client.delete(f"/api/papers/{paper['id']}", headers=operator).status_code == 400
+        ended_paper = ok(client.post("/api/papers", headers=operator, json={"book_id": book["id"],
+            "title": "Finished quiz", "knowledge_ids": [knowledge["id"]], "question_count": 1,
+            "score_each": 10, "difficulty": "any"}))
+        ok(client.post(f"/api/papers/{ended_paper['id']}/publish", headers=operator,
+                       json={"starts_at": start.isoformat(), "ends_at": end.isoformat()}))
+        with SessionLocal() as db:
+            db.get(Paper, ended_paper["id"]).ends_at = now() - timedelta(seconds=1)
+            db.commit()
+        assert ok(client.delete(f"/api/papers/{ended_paper['id']}", headers=operator))["deleted"] is True
+        assert client.get(f"/api/papers/{ended_paper['id']}", headers=operator).status_code == 404
         assert "snapshot" not in ok(client.get(f"/api/papers/{paper['id']}", headers=teacher))
         assert client.post(f"/api/papers/{paper['id']}/start", headers=teacher).status_code == 403
         admin_attempt = ok(client.post(f"/api/papers/{paper['id']}/start", headers=operator))
@@ -128,12 +154,62 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         variant_practice = ok(client.post("/api/practices", headers=student, json={
             "source_attempt_id": attempt["id"], "question_id": question["id"], "mode": "variant"}))
         assert variant_practice["question"]["id"] == variant["id"]
+        without_evidence = ok(client.post("/api/questions", headers=operator, json={
+            **question_data, "stem": "Which energy source do plants use?", "evidence": ""}))
+        assert "依据必须逐字出现在原文内容块中" in without_evidence["validation"]
+        assert ok(client.post(f"/api/questions/{without_evidence['id']}/review", headers=operator,
+                              json={"approve": True}))["status"] == "approved"
         page_data = {"printed_page": "1", "chapter": "Unit 1", "text": "Changed content.", "issues": []}
         ok(client.patch(f"/api/pages/{pages[0]['id']}", headers=operator, json=page_data))
         changed = ok(client.get(f"/api/books/{book['id']}/knowledge", headers=reviewer))[0]
         assert changed["status"] == "needs_review"
         old_exam = ok(client.get(f"/api/attempts/{attempt['id']}", headers=student))
         assert old_exam["result"][0]["evidence"] == quote
+        assert client.delete(f"/api/knowledge/{knowledge['id']}", headers=teacher).status_code == 403
+        ok(client.delete(f"/api/knowledge/{knowledge['id']}", headers=operator))
+        assert ok(client.get(f"/api/books/{book['id']}/knowledge", headers=operator)) == []
+        assert ok(client.get(f"/api/questions?book_id={book['id']}", headers=operator)) == []
+        assert client.post(f"/api/knowledge/{knowledge['id']}/review", headers=operator,
+                           json={"approve": True}).status_code == 404
+        assert ok(client.get(f"/api/attempts/{attempt['id']}", headers=student))["result"][0]["evidence"] == quote
+        assert client.delete(f"/api/books/{book['id']}", headers=teacher).status_code == 403
+        ok(client.delete(f"/api/books/{book['id']}", headers=operator))
+        assert all(item["id"] != book["id"] for item in ok(client.get("/api/books", headers=operator)))
+        assert client.get(f"/api/books/{book['id']}/learning", headers=operator).status_code == 404
+        assert ok(client.get(f"/api/papers/{paper['id']}", headers=student))["status"] == "published"
+        replacement = ok(client.post("/api/books?title=Biology", headers=operator,
+                                     files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")},
+                                     data={"manual_toc": "1|Unit 1|1"}))
+        assert replacement["id"] != book["id"]
+        schedule = ok(client.get(f"/api/papers/{paper['id']}", headers=operator))
+        changed_schedule = ok(client.patch(f"/api/papers/{paper['id']}/schedule", headers=operator,
+                                           json={"starts_at": schedule["starts_at"],
+                                                 "ends_at": (now() + timedelta(minutes=45)).isoformat()}))
+        assert changed_schedule["snapshot"] == schedule["snapshot"]
+        assert changed_schedule["ends_at"] != schedule["ends_at"]
+        ok(client.post("/api/users", headers=operator, json={"username": "student_open", "password": "student1234",
+                                                         "role": "student"}))
+        open_student = headers(client, "student_open", "student1234")
+        open_attempt = ok(client.post(f"/api/papers/{paper['id']}/start", headers=open_student))
+        ok(client.put(f"/api/attempts/{open_attempt['id']}/answer", headers=open_student,
+                      json={"question_id": question["id"], "answer": "A"}))
+        extended = ok(client.patch(f"/api/papers/{paper['id']}/schedule", headers=operator,
+                                   json={"starts_at": changed_schedule["starts_at"],
+                                         "ends_at": (now() + timedelta(minutes=60)).isoformat()}))
+        assert extended["ends_at"] != changed_schedule["ends_at"]
+        assert client.patch(f"/api/papers/{paper['id']}/schedule", headers=operator,
+                            json={"starts_at": (now() + timedelta(minutes=1)).isoformat(),
+                                  "ends_at": (now() + timedelta(minutes=45)).isoformat()}).status_code == 400
+        assert client.post(f"/api/papers/{paper['id']}/terminate", headers=teacher).status_code == 403
+        terminated = ok(client.post(f"/api/papers/{paper['id']}/terminate", headers=operator))
+        assert terminated["status"] == "terminated"
+        assert ok(client.get(f"/api/attempts/{open_attempt['id']}", headers=open_student))["score"] == 10
+        assert client.post(f"/api/papers/{paper['id']}/start", headers=open_student).status_code == 400
+        assert client.patch(f"/api/papers/{paper['id']}/schedule", headers=operator,
+                            json={"starts_at": schedule["starts_at"], "ends_at": schedule["ends_at"]}).status_code == 400
+        assert ok(client.delete(f"/api/papers/{paper['id']}", headers=operator))["deleted"] is True
+        assert all(item["id"] != paper["id"] for item in ok(client.get("/api/papers", headers=operator)))
+        assert ok(client.get(f"/api/attempts/{open_attempt['id']}", headers=open_student))["score"] == 10
 
 
 def test_cloud_provider_models_selection_and_vision(monkeypatch):
@@ -173,6 +249,32 @@ def test_cloud_provider_models_selection_and_vision(monkeypatch):
         assert ai.structured("test") == {"ok": True}
         assert ai.ocr_png(b"png") == "TEST 123"
         assert any(b"image_url" in request.content for request in requests)
+
+
+def test_ollama_vision_json_parser_failure_falls_back(monkeypatch):
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload.get("response_format"):
+            return httpx.Response(500, json={"error": "JSON grammar rejected vision output"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "项目2 CentOS Linux操作系统安装\n学习目标"}}]})
+
+    monkeypatch.setattr(ai, "_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(respond), timeout=timeout))
+    provider = ModelProvider(display_name="本机 Ollama", base_url="http://127.0.0.1:11434/v1", api_style="ollama")
+    assert ai._request(provider, "qwen3-vl:4b", [{"role": "user", "content": "classify"}], json_mode=True).startswith("项目2")
+    assert len(requests) == 2 and "response_format" not in requests[1]
+
+    from app.tasks import _visual_chapter
+    document = pymupdf.open()
+    document.new_page().insert_text((72, 72), "项目2 CentOS Linux操作系统安装")
+    toc = [{"level": 1, "title": "项目1 云计算", "pdf_page": 1},
+           {"level": 1, "title": "项目2 CentOS Linux操作系统安装", "pdf_page": 1}]
+    monkeypatch.setattr("app.tasks.vision_json", lambda png, prompt: {"raw_text": "项目2\nCentOS Linux操作系统安装\n学习目标"})
+    chapter, issues = _visual_chapter(document, 0, toc, {1})
+    assert chapter == "项目2 CentOS Linux操作系统安装" and "页面文字" in issues[0]
+    document.close()
 
 
 def test_directory_first_and_on_demand_chapter_workflow(monkeypatch):
@@ -241,17 +343,52 @@ def test_directory_first_and_on_demand_chapter_workflow(monkeypatch):
         knowledge = ok(client.get(f"/api/books/{book['id']}/knowledge", headers=admin))
         assert len(knowledge) == 1 and knowledge[0]["chapter"] == "Chapter 1 Cloud Basics"
         ok(client.post(f"/api/knowledge/{knowledge[0]['id']}/review", headers=admin, json={"approve": True}))
-        monkeypatch.setattr("app.tasks.structured", lambda prompt: {
-            "stem": "What does cloud computing offer?",
-            "options": {"A": "Compute services", "B": "Paper", "C": "Ink", "D": "Coal"},
-            "answer": "A", "explanation": "The chapter describes compute resources as services.",
-            "evidence": quote, "difficulty": "easy"})
+        question_calls = []
+
+        def generate_question(prompt):
+            question_calls.append(prompt)
+            return {"stem": "What does cloud computing offer?",
+                    "options": {"A": "Compute services", "B": "Paper", "C": "Ink", "D": "Coal"},
+                    "answer": "A", "explanation": "The chapter describes compute resources as services.",
+                    "evidence": "Compute resources are provided as services." if len(question_calls) == 1 else quote,
+                    "difficulty": "easy"}
+
+        monkeypatch.setattr("app.tasks.structured", generate_question)
         question_job = ok(client.post(f"/api/books/{book['id']}/generate-chapter-questions", headers=admin,
                                        json={"chapter": "Chapter 1 Cloud Basics", "count": 1,
                                              "selected_heading_indices": [0]}))
         assert question_job["status"] == "done"
         questions = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
         assert len(questions) == 1 and questions[0]["validation"] == []
+        assert len(question_calls) == 2
+        assert "上一次生成的依据不是教材原文" in question_calls[1]
+        monkeypatch.setattr("app.tasks.structured", lambda prompt: {
+            "stem": "What does cloud computing offer? Please explain.",
+            "options": {"A": "Compute services", "B": "Paper", "C": "Ink", "D": "Coal"},
+            "answer": "A", "explanation": "The chapter describes compute resources as services.",
+            "evidence": "The cloud automatically offers all services.", "difficulty": "easy"})
+        invalid_job = ok(client.post(f"/api/knowledge/{knowledge[0]['id']}/generate-question", headers=admin))
+        assert invalid_job["status"] == "done"
+        invalid = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))[0]
+        assert "依据必须逐字出现在原文内容块中" in invalid["validation"]
+        reviewed_invalid = ok(client.post(f"/api/questions/{invalid['id']}/review", headers=admin,
+                                          json={"approve": True, "note": "已人工核对题干与答案"}))
+        assert reviewed_invalid["status"] == "approved"
+        assert "人工确认原文提示" in reviewed_invalid["review_note"]
+        prompts = []
+
+        def detailed(prompt):
+            prompts.append(prompt)
+            return {"items": [{"chunk_id": first["chunk_id"], "title": f"Cloud detail {index}",
+                              "content": "Compute is offered as a service.", "source_quote": quote}
+                             for index in range(14)]}
+
+        monkeypatch.setattr("app.tasks.structured", detailed)
+        detailed_job = ok(client.post(f"/api/books/{book['id']}/extract-knowledge", headers=admin,
+                                      json={"chapter": "Chapter 1 Cloud Basics"}))
+        assert detailed_job["status"] == "done"
+        assert len(ok(client.get(f"/api/books/{book['id']}/knowledge", headers=admin))) == 15
+        assert prompts and "逐段阅读原文" in prompts[0]
         assert client.post(f"/api/books/{book['id']}/extract-knowledge", headers=admin,
                            json={"chapter": "前置内容"}).status_code == 400
 
@@ -286,6 +423,7 @@ def test_textbook_library_and_heading_scoped_questions(monkeypatch):
         second = next(item for item in sections if "Switches connect" in item["text"])
         created_knowledge = []
         for chunk, title, quote in [(first, "Layers", "Layered networks separate responsibilities."),
+                                    (first, "Layer responsibilities", "Layered networks separate responsibilities."),
                                     (second, "Switches", "Switches connect local devices.")]:
             knowledge = ok(client.post(f"/api/books/{book['id']}/knowledge", headers=admin, json={
                 "title": title, "content": quote, "chunk_id": chunk["chunk_id"],
@@ -298,9 +436,31 @@ def test_textbook_library_and_heading_scoped_questions(monkeypatch):
             "answer": "A", "explanation": "The device statement is on the same page.",
             "evidence": "Switches connect local devices.", "difficulty": "easy"}))
         assert "依据必须逐字出现在知识点的原文摘录中" in bad["validation"]
-        assert client.post(f"/api/questions/{bad['id']}/review", headers=admin, json={"approve": True}).status_code == 400
+        reviewed = ok(client.post(f"/api/questions/{bad['id']}/review", headers=admin,
+                                  json={"approve": True, "note": "人工核对后接受引用"}))
+        assert reviewed["status"] == "approved"
+        assert reviewed["validation"] == bad["validation"]
+        assert "人工核对后接受引用" in reviewed["review_note"]
+        structurally_bad = ok(client.post("/api/questions", headers=admin, json={
+            "knowledge_id": created_knowledge[0]["id"], "stem": "",
+            "options": {"A": "One", "B": "Two", "C": "Three", "D": "Four"},
+            "answer": "A", "explanation": "Manual check", "evidence": "", "difficulty": "easy"}))
+        assert client.post(f"/api/questions/{structurally_bad['id']}/review", headers=admin,
+                           json={"approve": True}).status_code == 400
+        paper = ok(client.post("/api/papers", headers=admin, json={
+            "book_id": book["id"], "title": "Manual source review", "chapter": "Chapter 7 Networks",
+            "knowledge_ids": [created_knowledge[0]["id"]], "question_count": 1,
+            "score_each": 10, "difficulty": "any"}))
+        start = now() - timedelta(minutes=1)
+        end = now() + timedelta(minutes=30)
+        published = ok(client.post(f"/api/papers/{paper['id']}/publish", headers=admin,
+                                   json={"starts_at": start.isoformat(), "ends_at": end.isoformat()}))
+        assert published["status"] == "published"
+        generated_prompts = []
+
         def generate(prompt):
-            quote = "Switches connect local devices." if "知识点：Switches" in prompt else "Layered networks separate responsibilities."
+            generated_prompts.append(prompt)
+            quote = "Switches connect local devices." if "Switches connect local devices." in prompt else "Layered networks separate responsibilities."
             return {"stem": f"Which fact is in the textbook: {quote}",
                     "options": {"A": quote, "B": "Other", "C": "Another", "D": "None"},
                     "answer": "A", "explanation": "The original text states this fact.",
@@ -320,5 +480,18 @@ def test_textbook_library_and_heading_scoped_questions(monkeypatch):
                                    "selected_heading_indices": [3]}))
         assert job["status"] == "done"
         questions = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
-        assert {item["evidence"] for item in questions} == {
+        assert {item["evidence"] for item in questions if item["id"] not in {bad["id"], structurally_bad["id"]}} == {
             "Layered networks separate responsibilities.", "Switches connect local devices."}
+        earlier_ids = {item["id"] for item in questions}
+        chapter_job = ok(client.post(f"/api/books/{book['id']}/generate-chapter-questions", headers=admin,
+                                     json={"chapter": "Chapter 7 Networks", "count": 2,
+                                           "selected_heading_indices": [0]}))
+        assert chapter_job["status"] == "done"
+        chapter_questions = [item for item in ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
+                             if item["id"] not in earlier_ids]
+        assert len(chapter_questions) == 2
+        assert {item["knowledge_id"] for item in chapter_questions} & {created_knowledge[2]["id"]}
+        assert {item["knowledge_id"] for item in chapter_questions} & {
+            created_knowledge[0]["id"], created_knowledge[1]["id"]}
+        assert any("所选目录标题：Chapter 7 Networks、7.2 Network devices" in prompt
+                   for prompt in generated_prompts)

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,7 @@ from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_
 from .db import Base, SessionLocal, engine, get_db, now
 from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
 from .security import bootstrap, check_password, current_user, hash_password, issue_token, roles
-from .services import audit, page_issues, question_public, question_snapshot, rebuild_chunks, scoped_knowledge, validate_question
+from .services import audit, blocking_question_errors, page_issues, question_public, question_snapshot, rebuild_chunks, scoped_knowledge, validate_question
 from .tasks import run_job
 
 
@@ -59,6 +60,20 @@ def require(value, message="记录不存在"):
     if value is None:
         raise HTTPException(404, message)
     return value
+
+
+def active_book(db: Session, book_id: int) -> Book:
+    book = require(db.get(Book, book_id))
+    if book.status == "deleted":
+        raise HTTPException(404, "教材已从教材库删除")
+    return book
+
+
+def active_knowledge(db: Session, knowledge_id: int) -> Knowledge:
+    item = require(db.get(Knowledge, knowledge_id))
+    if item.status == "deleted":
+        raise HTTPException(404, "知识点已删除")
+    return item
 
 
 def enqueue(db: Session, kind: str, target: int, key: str, payload=None):
@@ -283,11 +298,11 @@ async def upload_book(title: str, file: UploadFile = File(...),
     except (ValueError, RuntimeError, pymupdf.FileDataError) as exc:
         raise HTTPException(400, f"PDF 或目录设置无效：{exc}") from exc
     sha = hashlib.sha256(body).hexdigest()
-    if db.scalar(select(Book.id).where(Book.title == title, Book.sha256 == sha)):
+    if db.scalar(select(Book.id).where(Book.title == title, Book.sha256 == sha, Book.status != "deleted")):
         raise HTTPException(409, "教材库中已有相同名称和 PDF 的教材")
     path = Path(os.getenv("UPLOAD_DIR", "./data/uploads")) / f"{sha}.pdf"
     path.write_bytes(body)
-    book = Book(title=title, version=sha[:16], sha256=sha, file_path=str(path),
+    book = Book(title=title, version=f"{sha[:16]}-{secrets.token_hex(4)}", sha256=sha, file_path=str(path),
                 page_count=page_count, toc=entries, status="toc_review" if entries else "uploaded")
     db.add(book)
     db.flush()
@@ -299,7 +314,7 @@ async def upload_book(title: str, file: UploadFile = File(...),
 
 @app.get("/api/books")
 def books(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    query = select(Book).order_by(Book.id.desc())
+    query = select(Book).where(Book.status != "deleted").order_by(Book.id.desc())
     if user.role != "admin":
         query = query.where(Book.mapping_confirmed.is_(True))
     return [book_view(book) for book in db.scalars(query).all()]
@@ -307,15 +322,34 @@ def books(user: User = Depends(current_user), db: Session = Depends(get_db)):
 
 @app.get("/api/books/{book_id}")
 def book_detail(book_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     if user.role != "admin" and not book.mapping_confirmed:
         raise HTTPException(404, "教材不存在")
     return book_view(book)
 
 
+@app.delete("/api/books/{book_id}")
+def delete_book(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    book = require(db.get(Book, book_id))
+    if book.status == "deleted":
+        return {"id": book_id, "deleted": True}
+    before = book_view(book)
+    book.status = "deleted"
+    book.mapping_confirmed = False
+    knowledge_ids = set(db.scalars(select(Knowledge.id).where(Knowledge.book_id == book_id)).all())
+    for job in db.scalars(select(Job).where(Job.status.in_(["queued", "running", "retrying"]))).all():
+        if (job.target_id == book_id and job.kind in {"toc", "parse", "knowledge", "chapter_questions"} or
+                job.kind == "question" and job.target_id in knowledge_ids):
+            job.cancel_requested = True
+            job.status = "cancelled"
+    audit(db, "book", book.id, user.id, "delete", before, book_view(book))
+    db.commit()
+    return {"id": book_id, "deleted": True}
+
+
 @app.post("/api/books/{book_id}/parse")
 def parse_book(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book.id)
     if not book.toc or not catalog or not catalog.confirmed:
         raise HTTPException(400, "请先解析并确认目录，再解析章节正文")
@@ -333,7 +367,7 @@ def parse_book(book_id: int, user: User = Depends(roles("admin")), db: Session =
 
 @app.get("/api/books/{book_id}/catalog")
 def book_catalog(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book_id)
     return {"toc": book.toc, "toc_pages": catalog.toc_pages if catalog else [],
             "source": catalog.source if catalog else "pending", "raw_text": catalog.raw_text if catalog else "",
@@ -344,7 +378,7 @@ def book_catalog(book_id: int, user: User = Depends(roles("admin")), db: Session
 
 @app.post("/api/books/{book_id}/discover-toc")
 def discover_toc(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book_id)
     if catalog and catalog.confirmed:
         raise HTTPException(400, "目录已经确认；如需重新解析，请先编辑目录")
@@ -354,7 +388,7 @@ def discover_toc(book_id: int, user: User = Depends(roles("admin")), db: Session
 
 @app.get("/api/books/{book_id}/pages")
 def pages(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    require(db.get(Book, book_id))
+    active_book(db, book_id)
     return out(db.scalars(select(Page).where(Page.book_id == book_id).order_by(Page.pdf_page)).all())
 
 
@@ -373,7 +407,7 @@ class TocItem(BaseModel):
 
 @app.put("/api/books/{book_id}/toc")
 def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     active = db.scalar(select(Job.id).where(Job.kind == "parse", Job.target_id == book_id,
                                             Job.status.in_(["queued", "running", "retrying"])))
     if active:
@@ -386,10 +420,11 @@ def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("adm
         raise HTTPException(400, "目录至少需要一个章节")
     before = {"toc": book.toc}
     if validated != book.toc:
-        for knowledge in db.scalars(select(Knowledge).where(Knowledge.book_id == book_id)).all():
+        for knowledge in db.scalars(select(Knowledge).where(Knowledge.book_id == book_id,
+                                                            Knowledge.status != "deleted")).all():
             knowledge.status = "needs_review"
         for question in db.scalars(select(Question).join(Knowledge, Question.knowledge_id == Knowledge.id)
-                                   .where(Knowledge.book_id == book_id)).all():
+                                   .where(Knowledge.book_id == book_id, Knowledge.status != "deleted")).all():
             question.status = "needs_review"
     book.toc = validated
     catalog = db.get(BookCatalog, book_id)
@@ -414,7 +449,7 @@ def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("adm
 
 @app.post("/api/books/{book_id}/confirm-toc")
 def confirm_toc(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     if not chapter_entries(book.toc):
         raise HTTPException(400, "请先建立章节目录")
     catalog = db.get(BookCatalog, book_id)
@@ -432,7 +467,7 @@ def confirm_toc(book_id: int, user: User = Depends(roles("admin")), db: Session 
 @app.patch("/api/pages/{page_id}")
 def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     page = require(db.get(Page, page_id))
-    book = require(db.get(Book, page.book_id))
+    book = active_book(db, page.book_id)
     if data.chapter not in {"前置内容", *[item["title"] for item in chapter_entries(book.toc)]}:
         raise HTTPException(400, "页面章节必须来自已确认的目录")
     before = out(page)
@@ -448,7 +483,7 @@ def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("admin"))
 
 @app.post("/api/books/{book_id}/confirm-mapping")
 def confirm_mapping(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book_id)
     if not catalog or not catalog.confirmed or not catalog.classified:
         raise HTTPException(400, "请先确认目录并完成章节正文分类")
@@ -481,7 +516,7 @@ def confirm_mapping(book_id: int, user: User = Depends(roles("admin")), db: Sess
 
 @app.get("/api/books/{book_id}/learning")
 def learning(book_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     if not book.mapping_confirmed:
         raise HTTPException(400, "教材尚未建立索引")
     chunks = db.scalars(select(Chunk).where(Chunk.book_id == book_id, Chunk.active.is_(True)).order_by(Chunk.page_id, Chunk.position)).all()
@@ -527,7 +562,7 @@ class ChapterRequest(BaseModel):
 
 @app.post("/api/books/{book_id}/extract-knowledge")
 def extract_knowledge(book_id: int, data: ChapterRequest, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     if not book.mapping_confirmed:
         raise HTTPException(400, "请先确认目录与页码")
     if data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
@@ -539,7 +574,7 @@ def extract_knowledge(book_id: int, data: ChapterRequest, user: User = Depends(r
     existing = db.scalar(select(func.count(Knowledge.id)).where(Knowledge.book_id == book_id,
                         Knowledge.chapter == data.chapter, Knowledge.origin == "ai")) or 0
     chapter_key = hashlib.sha256(data.chapter.encode()).hexdigest()[:12]
-    return out(enqueue(db, "knowledge", book_id, f"knowledge:{book_id}:{chapter_key}:{newest}:{existing}",
+    return out(enqueue(db, "knowledge", book_id, f"knowledge:v2:{book_id}:{chapter_key}:{newest}:{existing}",
                        {"chapter": data.chapter}))
 
 
@@ -551,7 +586,7 @@ class ChapterQuestionsInput(ChapterRequest):
 @app.post("/api/books/{book_id}/generate-chapter-questions")
 def generate_chapter_questions(book_id: int, data: ChapterQuestionsInput,
                                user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     if not book.mapping_confirmed or data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
         raise HTTPException(400, "请先确认目录与章节，并选择一个有效章节")
     if not data.selected_heading_indices:
@@ -573,8 +608,9 @@ def generate_chapter_questions(book_id: int, data: ChapterQuestionsInput,
 
 @app.get("/api/books/{book_id}/knowledge")
 def list_knowledge(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    require(db.get(Book, book_id))
-    return out(db.scalars(select(Knowledge).where(Knowledge.book_id == book_id).order_by(Knowledge.id.desc())).all())
+    active_book(db, book_id)
+    return out(db.scalars(select(Knowledge).where(Knowledge.book_id == book_id,
+        Knowledge.status != "deleted").order_by(Knowledge.id.desc())).all())
 
 
 class KnowledgeInput(BaseModel):
@@ -587,7 +623,7 @@ class KnowledgeInput(BaseModel):
 
 @app.post("/api/books/{book_id}/knowledge")
 def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, book_id))
+    book = active_book(db, book_id)
     chunk = db.get(Chunk, data.chunk_id) if data.chunk_id else None
     if chunk and (chunk.book_id != book.id or not chunk.active):
         raise HTTPException(400, "原文块不属于本教材当前版本")
@@ -606,7 +642,8 @@ def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(ro
 
 @app.patch("/api/knowledge/{knowledge_id}")
 def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    item = require(db.get(Knowledge, knowledge_id))
+    item = active_knowledge(db, knowledge_id)
+    active_book(db, item.book_id)
     before = out(item)
     chunk = db.get(Chunk, data.chunk_id) if data.chunk_id else None
     if chunk and (chunk.book_id != item.book_id or not chunk.active or data.source_quote not in chunk.text):
@@ -623,6 +660,26 @@ def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends
     return out(item)
 
 
+@app.delete("/api/knowledge/{knowledge_id}")
+def delete_knowledge(knowledge_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    item = require(db.get(Knowledge, knowledge_id))
+    if item.status == "deleted":
+        return {"id": knowledge_id, "deleted": True}
+    active_book(db, item.book_id)
+    before = out(item)
+    item.status = "deleted"
+    item.review_note = "已由管理员删除；历史试卷快照保留"
+    for job in db.scalars(select(Job).where(Job.status.in_(["queued", "running", "retrying"]))).all():
+        if (job.kind == "question" and job.target_id == item.id or
+                job.kind in {"knowledge", "chapter_questions"} and job.target_id == item.book_id and
+                (job.payload or {}).get("chapter") == item.chapter):
+            job.cancel_requested = True
+            job.status = "cancelled"
+    audit(db, "knowledge", item.id, user.id, "delete", before, out(item))
+    db.commit()
+    return {"id": knowledge_id, "deleted": True}
+
+
 class ReviewInput(BaseModel):
     approve: bool
     note: str = ""
@@ -630,8 +687,8 @@ class ReviewInput(BaseModel):
 
 @app.post("/api/knowledge/{knowledge_id}/review")
 def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    item = require(db.get(Knowledge, knowledge_id))
-    book = require(db.get(Book, item.book_id))
+    item = active_knowledge(db, knowledge_id)
+    book = active_book(db, item.book_id)
     if data.approve and not book.mapping_confirmed:
         raise HTTPException(400, "请先确认章节索引")
     if data.approve and item.chunk_id:
@@ -651,8 +708,8 @@ def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(
 
 @app.post("/api/knowledge/{knowledge_id}/generate-question")
 def generate_question(knowledge_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    item = require(db.get(Knowledge, knowledge_id))
-    book = require(db.get(Book, item.book_id))
+    item = active_knowledge(db, knowledge_id)
+    book = active_book(db, item.book_id)
     if not book.mapping_confirmed or item.chapter not in {entry["title"] for entry in chapter_entries(book.toc)}:
         raise HTTPException(400, "请先确认章节索引和知识点所属章节")
     if item.status != "approved" or not item.chunk_id:
@@ -674,14 +731,15 @@ class QuestionInput(BaseModel):
 
 @app.get("/api/questions")
 def questions(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    ids = select(Knowledge.id).where(Knowledge.book_id == book_id)
+    active_book(db, book_id)
+    ids = select(Knowledge.id).where(Knowledge.book_id == book_id, Knowledge.status != "deleted")
     return out(db.scalars(select(Question).where(Question.knowledge_id.in_(ids)).order_by(Question.id.desc())).all())
 
 
 @app.post("/api/questions")
 def create_question(data: QuestionInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    knowledge = require(db.get(Knowledge, data.knowledge_id))
-    book = require(db.get(Book, knowledge.book_id))
+    knowledge = active_knowledge(db, data.knowledge_id)
+    book = active_book(db, knowledge.book_id)
     if not book.mapping_confirmed:
         raise HTTPException(400, "请先确认章节索引")
     if not knowledge.chunk_id:
@@ -700,7 +758,12 @@ def create_question(data: QuestionInput, user: User = Depends(roles("admin")), d
 @app.patch("/api/questions/{question_id}")
 def edit_question(question_id: int, data: QuestionInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
-    knowledge = require(db.get(Knowledge, data.knowledge_id))
+    old_knowledge = active_knowledge(db, question.knowledge_id)
+    active_book(db, old_knowledge.book_id)
+    knowledge = active_knowledge(db, data.knowledge_id)
+    active_book(db, knowledge.book_id)
+    if knowledge.book_id != old_knowledge.book_id:
+        raise HTTPException(400, "题目不能改为关联另一教材的知识点")
     if not knowledge.chunk_id:
         raise HTTPException(400, "题目必须绑定教材原文")
     before = out(question)
@@ -716,6 +779,8 @@ def edit_question(question_id: int, data: QuestionInput, user: User = Depends(ro
 @app.post("/api/questions/{question_id}/validate")
 def revalidate(question_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
+    knowledge = active_knowledge(db, question.knowledge_id)
+    active_book(db, knowledge.book_id)
     question.validation = validate_question(db, question)
     db.commit()
     return out(question)
@@ -724,15 +789,19 @@ def revalidate(question_id: int, user: User = Depends(roles("admin")), db: Sessi
 @app.post("/api/questions/{question_id}/review")
 def review_question(question_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
-    knowledge = require(db.get(Knowledge, question.knowledge_id))
-    book = require(db.get(Book, knowledge.book_id))
+    knowledge = active_knowledge(db, question.knowledge_id)
+    book = active_book(db, knowledge.book_id)
     if data.approve and not book.mapping_confirmed:
         raise HTTPException(400, "请先确认章节索引")
     before = out(question)
     question.validation = validate_question(db, question)
+    blocking = blocking_question_errors(question.validation)
+    if data.approve and blocking:
+        raise HTTPException(400, {"validation": blocking})
+    review_note = data.note.strip()
     if data.approve and question.validation:
-        raise HTTPException(400, {"validation": question.validation})
-    question.status, question.review_note = ("approved" if data.approve else "rejected"), data.note
+        review_note = "\n".join(filter(None, [review_note, "人工确认原文提示：" + "；".join(question.validation)]))
+    question.status, question.review_note = ("approved" if data.approve else "rejected"), review_note
     audit(db, "question", question.id, user.id, "review", before, out(question))
     db.commit()
     return out(question)
@@ -750,7 +819,7 @@ class PaperInput(BaseModel):
 
 @app.post("/api/papers")
 def create_paper(data: PaperInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    book = require(db.get(Book, data.book_id))
+    book = active_book(db, data.book_id)
     if not book.mapping_confirmed:
         raise HTTPException(400, "请先确认章节索引")
     if data.chapter and data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
@@ -789,7 +858,7 @@ def create_paper(data: PaperInput, user: User = Depends(roles("admin")), db: Ses
 
 @app.get("/api/papers")
 def papers(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    query = select(Paper).order_by(Paper.id.desc())
+    query = select(Paper).where(Paper.status != "deleted").order_by(Paper.id.desc())
     if user.role != "admin":
         query = query.where(Paper.status == "published")
     result = out(db.scalars(query).all())
@@ -803,6 +872,8 @@ def papers(user: User = Depends(current_user), db: Session = Depends(get_db)):
 @app.get("/api/papers/{paper_id}")
 def paper_detail(paper_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     paper = require(db.get(Paper, paper_id))
+    if paper.status == "deleted":
+        raise HTTPException(404, "试卷已删除")
     if user.role != "admin":
         if paper.status != "published":
             raise HTTPException(404, "试卷不存在")
@@ -816,18 +887,22 @@ class PublishInput(BaseModel):
     ends_at: datetime
 
 
+def _utc_naive(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+
+
 @app.post("/api/papers/{paper_id}/publish")
 def publish(paper_id: int, data: PublishInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     paper = require(db.get(Paper, paper_id))
+    active_book(db, paper.book_id)
     if paper.status != "draft":
         raise HTTPException(400, "试卷已经发布")
-    start = data.starts_at.astimezone(timezone.utc).replace(tzinfo=None) if data.starts_at.tzinfo else data.starts_at
-    end = data.ends_at.astimezone(timezone.utc).replace(tzinfo=None) if data.ends_at.tzinfo else data.ends_at
+    start, end = _utc_naive(data.starts_at), _utc_naive(data.ends_at)
     if end <= start or end <= now():
         raise HTTPException(400, "考试结束时间无效")
     questions = [require(db.get(Question, qid), "试题不存在") for qid in paper.rule["question_ids"]]
     for question in questions:
-        if question.status != "approved" or validate_question(db, question):
+        if question.status != "approved" or blocking_question_errors(validate_question(db, question)):
             raise HTTPException(400, f"试题 {question.id} 已变化或未通过审核")
     snapshot = [question_snapshot(q, paper.rule["score_each"]) for q in questions]
     if sum(q["score"] for q in snapshot) != paper.total_score:
@@ -839,7 +914,63 @@ def publish(paper_id: int, data: PublishInput, user: User = Depends(roles("admin
     return out(paper)
 
 
-def grade(db: Session, attempt: Attempt, paper: Paper):
+@app.patch("/api/papers/{paper_id}/schedule")
+def change_paper_schedule(paper_id: int, data: PublishInput,
+                          user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
+    if paper.status != "published":
+        raise HTTPException(400, "只能修改已发布且未终止的考试时间")
+    attempts = db.scalars(select(Attempt).where(Attempt.paper_id == paper_id)).all()
+    if paper.ends_at <= now() and attempts:
+        raise HTTPException(400, "已有答卷的考试结束后不能重新开放；可新建试卷")
+    start, end = _utc_naive(data.starts_at), _utc_naive(data.ends_at)
+    if end <= start or end <= now():
+        raise HTTPException(400, "结束时间须晚于开始时间及当前时间；提前结束请使用终止考试")
+    if attempts and start != paper.starts_at:
+        raise HTTPException(400, "已有答卷时只能调整结束时间")
+    before = {"starts_at": str(paper.starts_at), "ends_at": str(paper.ends_at)}
+    paper.starts_at, paper.ends_at = start, end
+    audit(db, "paper", paper.id, user.id, "change_schedule", before,
+          {"starts_at": str(start), "ends_at": str(end)})
+    db.commit()
+    return out(paper)
+
+
+def _grade_open_attempts(db: Session, paper: Paper):
+    attempts = db.scalars(select(Attempt).where(Attempt.paper_id == paper.id,
+                                                Attempt.submitted_at.is_(None)).with_for_update()).all()
+    for attempt in attempts:
+        grade(db, attempt, paper, commit=False)
+
+
+@app.post("/api/papers/{paper_id}/terminate")
+def terminate_paper(paper_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
+    if paper.status != "published" or paper.ends_at <= now():
+        raise HTTPException(400, "只能提前终止尚未结束的已发布考试")
+    before = {"status": paper.status, "starts_at": str(paper.starts_at), "ends_at": str(paper.ends_at)}
+    paper.status, paper.ends_at = "terminated", now()
+    _grade_open_attempts(db, paper)
+    audit(db, "paper", paper.id, user.id, "terminate", before,
+          {"status": paper.status, "ends_at": str(paper.ends_at)})
+    db.commit()
+    return out(paper)
+
+
+@app.delete("/api/papers/{paper_id}")
+def delete_paper(paper_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
+    if paper.status != "terminated" and not (paper.status == "published" and paper.ends_at <= now()):
+        raise HTTPException(400, "只有已结束或已终止的试卷可以删除")
+    before = out(paper)
+    _grade_open_attempts(db, paper)
+    paper.status = "deleted"
+    audit(db, "paper", paper.id, user.id, "delete", before, out(paper))
+    db.commit()
+    return {"id": paper.id, "deleted": True}
+
+
+def grade(db: Session, attempt: Attempt, paper: Paper, commit: bool = True):
     if attempt.submitted_at:
         return
     result = []
@@ -851,12 +982,13 @@ def grade(db: Session, attempt: Attempt, paper: Paper):
                        "correct_answer": item["answer"], "explanation": item["explanation"],
                        "evidence": item["evidence"], "stem": item["stem"], "options": item["options"]})
     attempt.result, attempt.score, attempt.submitted_at = result, sum(r["score"] for r in result), now()
-    db.commit()
+    if commit:
+        db.commit()
 
 
 @app.post("/api/papers/{paper_id}/start")
 def start_exam(paper_id: int, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
-    paper = require(db.get(Paper, paper_id))
+    paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
     if paper.status != "published":
         raise HTTPException(400, "考试尚未发布")
     attempt = db.scalar(select(Attempt).where(Attempt.paper_id == paper_id, Attempt.user_id == user.id))
@@ -898,7 +1030,7 @@ def save_answer(attempt_id: int, data: AnswerInput, user: User = Depends(roles("
     paper = db.get(Paper, attempt.paper_id)
     if attempt.user_id != user.id:
         raise HTTPException(403, "无权访问")
-    if attempt.submitted_at or now() >= paper.ends_at:
+    if attempt.submitted_at or paper.status != "published" or now() >= paper.ends_at:
         grade(db, attempt, paper)
         raise HTTPException(400, "考试已结束")
     question = next((q for q in paper.snapshot if q["id"] == data.question_id), None)
@@ -985,6 +1117,10 @@ def create_practice(data: PracticeInput, user: User = Depends(roles("student", "
     elif data.mode == "variant":
         question = db.scalar(select(Question).where(Question.variant_of == original.id, Question.status == "approved").order_by(Question.id.desc()))
         if not question:
+            knowledge = db.get(Knowledge, original.knowledge_id)
+            book = db.get(Book, knowledge.book_id) if knowledge else None
+            if not knowledge or knowledge.status == "deleted" or not book or book.status == "deleted":
+                raise HTTPException(400, "教材或知识点已删除，无法生成变式题；仍可使用已审核原题重练")
             job = enqueue(db, "question", original.knowledge_id,
                           f"variant:{original.id}:{user.id}", {"variant_of": original.id})
             return {"pending_review": True, "job": out(job)}
