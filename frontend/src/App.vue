@@ -39,11 +39,11 @@ const practice = ref<any>(null)
 const remaining = ref('')
 
 const uploadTitle = ref('')
-const uploadVersion = ref('第 1 版')
 const uploadFile = ref<File | null>(null)
 const uploadTocPages = ref('')
 const uploadManualToc = ref('')
 const chapterQuestionCount = ref(1)
+const selectedHeadingIndices = ref<number[]>([])
 const knowledgeEdit = ref<number | null>(null)
 const knowledgeForm = ref<any>({ title: '', content: '', chunk_id: null, source_quote: '', chapter: '' })
 const questionEdit = ref<number | null>(null)
@@ -65,6 +65,16 @@ const chapterSections = computed(() => (learning.value?.sections || []).filter((
 const chapterKnowledge = computed(() => knowledge.value.filter(k => k.chapter === selectedChapter.value))
 const chapterQuestions = computed(() => questions.value.filter(q => knowledge.value.find(k => k.id === q.knowledge_id)?.chapter === selectedChapter.value))
 const approvedChapterKnowledge = computed(() => approvedKnowledge.value.filter(k => k.chapter === selectedChapter.value))
+const chapterOutline = computed<any[]>(() => {
+  const toc = catalog.value?.toc || []
+  const roots = new Set((catalog.value?.chapters || []).map((item: any) => item.title))
+  const start = toc.findIndex((item: any) => item.title === selectedChapter.value && roots.has(item.title))
+  if (start < 0) return []
+  const stop = toc.findIndex((item: any, index: number) => index > start && roots.has(item.title))
+  const rootLevel = toc[start].level
+  return toc.slice(start, stop < 0 ? undefined : stop).map((item: any, offset: number) => ({ ...item, index: start + offset })).filter((item: any) => item.index === start || item.level > rootLevel)
+})
+const headingSelectionReady = computed(() => chapterOutline.value.length > 0 && (chapterOutline.value.length === 1 || selectedHeadingIndices.value.length > 0))
 const wrongRows = computed(() => result.value?.result?.filter((r: any) => !r.correct) || [])
 
 function statusName(status: string) {
@@ -107,13 +117,15 @@ async function refresh() {
 }
 async function loadBook(id: number) {
   const changedBook = bookId.value !== id
+  const previousToc = catalog.value?.toc
   bookId.value = id
   selectedPage.value = null
   if (isStaff.value) {
     const [p, k, q, c] = await Promise.all([api(`/books/${id}/pages`), api(`/books/${id}/knowledge`), api(`/questions?book_id=${id}`), api(`/books/${id}/catalog`)])
     pages.value = p; knowledge.value = k; questions.value = q; catalog.value = c
     tocDraft.value = JSON.parse(JSON.stringify(c.toc || []))
-    if (changedBook || !chapterNames.value.includes(selectedChapter.value)) selectedChapter.value = chapterNames.value[0] || ''
+    if (JSON.stringify(previousToc) !== JSON.stringify(c.toc)) selectedHeadingIndices.value = []
+    if (changedBook || !chapterNames.value.includes(selectedChapter.value)) { selectedChapter.value = chapterNames.value[0] || ''; selectedHeadingIndices.value = [] }
   }
   try { learning.value = await api(`/books/${id}/learning`) } catch { learning.value = null }
   if (!isStaff.value) {
@@ -126,7 +138,7 @@ async function upload() {
   const form = new FormData(); form.append('file', uploadFile.value)
   form.append('toc_pages', uploadTocPages.value)
   form.append('manual_toc', uploadManualToc.value)
-  const params = new URLSearchParams({ title: uploadTitle.value, version: uploadVersion.value })
+  const params = new URLSearchParams({ title: uploadTitle.value })
   const book = await act(() => api(`/books?${params}`, 'POST', form), '教材已保存')
   if (book) { await refresh(); await loadBook(book.id); tab.value = 'books' }
 }
@@ -193,8 +205,29 @@ async function extractKnowledge() {
 }
 async function generateChapterQuestions() {
   if (!selectedChapter.value) { error.value = '请先选择章节'; return }
-  await act(() => api(`/books/${bookId.value}/generate-chapter-questions`, 'POST', { chapter: selectedChapter.value, count: chapterQuestionCount.value }), '本章出题任务已入队')
+  if (!headingSelectionReady.value) { error.value = '请选择目录标题；勾选大标题会自动包含小标题'; return }
+  const selected = selectedHeadingIndices.value.length ? selectedHeadingIndices.value : [chapterOutline.value[0].index]
+  await act(() => api(`/books/${bookId.value}/generate-chapter-questions`, 'POST', { chapter: selectedChapter.value, count: chapterQuestionCount.value, selected_heading_indices: selected }), '所选目录范围的出题任务已入队')
   await refresh()
+}
+function toggleHeading(index: number, checked: boolean) {
+  const outline = chapterOutline.value
+  const position = outline.findIndex((item: any) => item.index === index)
+  if (position < 0) return
+  const indices = [index]
+  for (const item of outline.slice(position + 1)) {
+    if (item.level <= outline[position].level) break
+    indices.push(item.index)
+  }
+  const current = new Set(selectedHeadingIndices.value)
+  for (const value of indices) checked ? current.add(value) : current.delete(value)
+  if (!checked) {
+    let level = outline[position].level
+    for (let previous = position - 1; previous >= 0; previous--) {
+      if (outline[previous].level < level) { current.delete(outline[previous].index); level = outline[previous].level }
+    }
+  }
+  selectedHeadingIndices.value = [...current]
 }
 function chooseKnowledge(k?: any) {
   knowledgeEdit.value = k?.id || null
@@ -217,6 +250,7 @@ function chooseQuestion(q?: any) {
 }
 function onChapterChange() {
   selectedPage.value = null
+  selectedHeadingIndices.value = []
   paperForm.value.knowledge_ids = []
   chooseKnowledge()
   chooseQuestion()
@@ -298,19 +332,20 @@ onUnmounted(() => { if (interval) clearInterval(interval) })
     <main v-if="!user" class="login-wrap"><section class="login-hero"><p class="eyebrow">LEARNING OPERATIONS</p><h1>从一页教材<br>到一次有效学习。</h1><p>解析、审核、出题、考试与错题练习，都沿着原文出处有序推进。</p><div class="flow-mini"><span>教材 PDF</span><i>→</i><span>知识点</span><i>→</i><span>题库</span><i>→</i><span>考试</span></div></section><section class="login-card"><p class="eyebrow">WELCOME BACK</p><h2>登录工作台</h2><p class="muted">首次使用 admin 登录；教师和学生账号由 admin 创建。</p><label>用户名<input v-model="auth.username" autocomplete="username" /></label><label>密码<input v-model="auth.password" type="password" autocomplete="current-password" @keyup.enter="login" /></label><button class="primary full" :disabled="busy" @click="login">登录</button><p v-if="error" class="alert error">{{ error }}</p></section></main>
     <div v-else class="workspace"><aside class="sidebar"><div class="side-label">工作区</div><button :class="{ active: tab === 'overview' }" @click="tab = 'overview'">◫ <span>总览</span></button><button :class="{ active: tab === 'books' }" @click="tab = 'books'">▤ <span>教材与学习</span></button><template v-if="isStaff"><button :class="{ active: tab === 'knowledge' }" @click="tab = 'knowledge'">◇ <span>知识点审核</span></button><button :class="{ active: tab === 'questions' }" @click="tab = 'questions'">☷ <span>试题审核</span></button><button :class="{ active: tab === 'papers' }" @click="tab = 'papers'">▣ <span>组卷与发布</span></button><button :class="{ active: tab === 'jobs' }" @click="tab = 'jobs'">◴ <span>后台任务</span></button><button :class="{ active: tab === 'models' }" @click="tab = 'models'">✦ <span>模型接入</span></button><button :class="{ active: tab === 'users' }" @click="tab = 'users'">♙ <span>账号管理</span></button></template><template v-if="canExam"><button :class="{ active: tab === 'exam' }" @click="tab = 'exam'">✎ <span>参加考试</span></button><button :class="{ active: tab === 'results' }" @click="tab = 'results'">◈ <span>成绩与错题</span></button></template><div class="side-footer">PDF · 单选题 · 人工审核<br>第一版闭环</div></aside>
       <div class="content"><div v-if="error" class="alert error"><span>{{ error }}</span><button @click="error = ''">×</button></div><div v-if="notice" class="alert success">{{ notice }}</div>
-        <section v-if="tab === 'overview'"><div class="page-head"><div><p class="eyebrow">WORKSPACE</p><h1>工作总览</h1><p>按教材原文、审核记录和试卷快照，追踪每一步。</p></div><button class="secondary" @click="refresh">刷新数据</button></div><div class="stat-grid"><div class="stat"><span>教材版本</span><strong>{{ books.length }}</strong><small>原 PDF 留存</small></div><div class="stat"><span>{{ isStaff ? '待审核知识点' : '已参加考试' }}</span><strong>{{ isStaff ? knowledge.filter(k => k.status !== 'approved').length : attempts.length }}</strong><small>{{ isStaff ? '需要人工判断' : '每场考试限一次交卷' }}</small></div><div class="stat"><span>{{ isStaff ? '待审核试题' : '知识点掌握' }}</span><strong>{{ isStaff ? questions.filter(q => q.status !== 'approved').length : Object.keys(mastery).length }}</strong><small>{{ isStaff ? '校验后方可发布' : '依据答卷记录' }}</small></div><div class="stat"><span>已发布试卷</span><strong>{{ papers.filter(p => p.status === 'published').length }}</strong><small>答案与规则固定</small></div></div><div class="panel"><h2>闭环进度</h2><div class="steps"><div v-for="(step, i) in ['上传 PDF', '校对索引', '知识点审核', '试题审核', '组卷发布', '判分重练']" :key="step"><b>{{ String(i + 1).padStart(2, '0') }}</b><span>{{ step }}</span></div></div></div><div v-if="isStaff" class="panel"><div class="panel-head"><h2>模型接入</h2><button class="small" @click="tab = 'models'">管理提供商</button></div><div class="source-line"><span>文本：{{ aiStatus?.text?.provider || '未设置' }} / {{ aiStatus?.text?.model || '未设置' }}</span><span>视觉 OCR：{{ aiStatus?.vision?.provider || '未设置' }} / {{ aiStatus?.vision?.model || '未设置' }}</span></div></div><div v-if="isStaff && jobs.some(j => j.status === 'failed')" class="panel warning"><h3>需要处理的任务</h3><p>有任务失败。打开“后台任务”查看错误，并重试或人工修正。</p></div></section>
+        <section v-if="tab === 'overview'"><div class="page-head"><div><p class="eyebrow">WORKSPACE</p><h1>工作总览</h1><p>按教材原文、审核记录和试卷快照，追踪每一步。</p></div><button class="secondary" @click="refresh">刷新数据</button></div><div class="stat-grid"><div class="stat"><span>教材库</span><strong>{{ books.length }}</strong><small>原 PDF 留存</small></div><div class="stat"><span>{{ isStaff ? '待审核知识点' : '已参加考试' }}</span><strong>{{ isStaff ? knowledge.filter(k => k.status !== 'approved').length : attempts.length }}</strong><small>{{ isStaff ? '需要人工判断' : '每场考试限一次交卷' }}</small></div><div class="stat"><span>{{ isStaff ? '待审核试题' : '知识点掌握' }}</span><strong>{{ isStaff ? questions.filter(q => q.status !== 'approved').length : Object.keys(mastery).length }}</strong><small>{{ isStaff ? '校验后方可发布' : '依据答卷记录' }}</small></div><div class="stat"><span>已发布试卷</span><strong>{{ papers.filter(p => p.status === 'published').length }}</strong><small>答案与规则固定</small></div></div><div class="panel"><h2>闭环进度</h2><div class="steps"><div v-for="(step, i) in ['上传 PDF', '校对索引', '知识点审核', '试题审核', '组卷发布', '判分重练']" :key="step"><b>{{ String(i + 1).padStart(2, '0') }}</b><span>{{ step }}</span></div></div></div><div v-if="isStaff" class="panel"><div class="panel-head"><h2>模型接入</h2><button class="small" @click="tab = 'models'">管理提供商</button></div><div class="source-line"><span>文本：{{ aiStatus?.text?.provider || '未设置' }} / {{ aiStatus?.text?.model || '未设置' }}</span><span>视觉 OCR：{{ aiStatus?.vision?.provider || '未设置' }} / {{ aiStatus?.vision?.model || '未设置' }}</span></div></div><div v-if="isStaff && jobs.some(j => j.status === 'failed')" class="panel warning"><h3>需要处理的任务</h3><p>有任务失败。打开“后台任务”查看错误，并重试或人工修正。</p></div></section>
 
         <section v-if="tab === 'books'">
           <div class="page-head"><div><p class="eyebrow">SOURCE LIBRARY</p><h1>教材目录与章节</h1><p>先确定目录和 PDF 起始页，再用视觉模型核对章节边界，最后建立可追溯的学习内容。</p></div></div>
           <div v-if="isOperator" class="panel form-panel">
-            <h2>上传教材版本</h2><div class="form-row"><label>教材名称<input v-model="uploadTitle" placeholder="如：OpenStack" /></label><label>版本<input v-model="uploadVersion" /></label><label>PDF 文件<input type="file" accept="application/pdf,.pdf" @change="uploadFile = ($event.target as HTMLInputElement).files?.[0] || null" /></label></div>
+            <h2>上传教材到教材库</h2><div class="form-row"><label>教材名称<input v-model="uploadTitle" placeholder="如：OpenStack" /></label><label>PDF 文件<input type="file" accept="application/pdf,.pdf" @change="uploadFile = ($event.target as HTMLInputElement).files?.[0] || null" /></label></div>
             <div class="form-row"><label>目录所在 PDF 页（可选）<input v-model="uploadTocPages" placeholder="如：6-13；留空则自动查找" /></label><label>手工目录（可选，每行：层级|章节标题|PDF起始页）<textarea v-model="uploadManualToc" rows="3" placeholder="1|项目1 初识云计算|15&#10;1|项目2 安装系统|25"></textarea></label></div>
             <p class="muted">有手工目录时优先使用；没有时先读取 PDF 书签或目录页。起始页是 PDF 页码，导入后仍可逐条校对。</p><button class="primary" :disabled="busy || !uploadTitle || !uploadFile" @click="upload">保存教材与目录设置</button>
           </div>
-          <div class="selector-row"><span>当前教材</span><select :value="bookId || ''" @change="loadBook(Number(($event.target as HTMLSelectElement).value))"><option v-for="b in books" :key="b.id" :value="b.id">{{ b.title }} · {{ b.version }}</option></select><span v-if="selectedBook" class="badge">{{ statusName(selectedBook.status) }}</span><button class="text-btn" @click="refresh">刷新教材</button></div>
+          <div class="panel"><div class="panel-head"><h2>教材库</h2><span>{{ books.length }} 本教材</span></div><div v-if="books.length" class="library-grid"><button v-for="b in books" :key="b.id" class="library-book" :class="{ selected: b.id === bookId }" @click="loadBook(b.id)"><strong>{{ b.title }}</strong><span>{{ b.page_count }} 页 · {{ statusName(b.status) }}</span><small>导入于 {{ time(b.created_at) }}</small></button></div><p v-else class="empty">教材库尚无教材，请上传 PDF。</p></div>
+          <div v-if="selectedBook" class="selector-row"><span>当前教材</span><strong>{{ selectedBook.title }}</strong><span class="badge">{{ statusName(selectedBook.status) }}</span><button class="text-btn" @click="refresh">刷新教材</button></div>
           <template v-if="selectedBook">
             <div v-if="isOperator" class="panel"><h2>处理顺序</h2><div class="action-strip"><button class="secondary" :disabled="busy || catalog?.confirmed" @click="discoverToc">① 解析目录</button><button class="secondary" :disabled="busy || !tocDraft.length || catalog?.confirmed || tocDirty" @click="confirmToc">② 确认目录</button><button class="secondary" :disabled="busy || !catalog?.confirmed" @click="startParse">③ 视觉核对并解析章节</button><button class="primary" :disabled="busy || !catalog?.classified || pages.length !== selectedBook.page_count" @click="confirmMapping">④ 确认章节 / 建立索引</button></div><p class="muted">{{ selectedBook.page_count }} 页 · {{ catalog?.chapters?.length || 0 }} 章/项目。目录发现后请先保存修正，再确认。解析任务进度在“后台任务”查看。</p></div>
-            <div v-if="isStaff" class="panel"><div class="panel-head"><h2>章节目录</h2><button class="small" @click="tocDraft.push({ level: 1, title: '', pdf_page: 1 })">添加章节</button></div>
+            <div v-if="isStaff" class="panel"><div class="panel-head"><h2>章节目录</h2><div class="button-row"><button class="small" @click="tocDraft.push({ level: 1, title: '', pdf_page: selectedBook.page_count || 1 })">添加章节</button><button class="small" @click="tocDraft.push({ level: 2, title: '', pdf_page: selectedBook.page_count || 1 })">添加小标题</button></div></div>
               <p class="muted">来源：{{ catalog?.source === 'manual' ? '人工录入' : catalog?.source === 'bookmarks' ? 'PDF 书签' : catalog?.source === 'directory' ? '目录页' : '待解析' }} · {{ catalog?.confirmed ? '已确认' : '待人工确认' }}</p>
               <div v-for="warning in catalog?.warnings || []" :key="warning" class="issue">{{ warning }}</div>
               <div v-if="tocDraft.length" class="toc-edit"><div v-for="(t, i) in tocDraft" :key="i"><input v-model.number="t.level" type="number" min="1" max="8" aria-label="层级" /><input v-model="t.title" aria-label="章节标题" /><input v-model.number="t.pdf_page" type="number" min="1" aria-label="PDF 起始页" /><button class="text-btn" @click="tocDraft.splice(i, 1)">移除</button></div></div><p v-else class="empty">尚无目录。点击“解析目录”，或添加章节并填写 PDF 起始页。</p>
@@ -333,8 +368,9 @@ onUnmounted(() => { if (interval) clearInterval(interval) })
         </section>
 
         <section v-if="tab === 'questions' && isStaff">
-          <div class="page-head"><div><p class="eyebrow">CHAPTER QUESTIONS</p><h1>按章节出题与审核</h1><p>从本章已审核知识点生成单选题，答案依据必须来自本章原文。</p></div><div class="button-row"><input v-model.number="chapterQuestionCount" type="number" min="1" max="30" aria-label="生成题数" class="count-input" /><button class="primary" :disabled="busy || !approvedChapterKnowledge.length" @click="generateChapterQuestions">生成本章题目</button></div></div>
-          <div class="selector-row"><span>章节</span><select v-model="selectedChapter" @change="onChapterChange"><option v-for="chapter in chapterNames" :key="chapter" :value="chapter">{{ chapter }}</option></select><span>{{ chapterQuestions.length }} 道题 · {{ approvedChapterKnowledge.length }} 条已审核知识点</span></div>
+          <div class="page-head"><div><p class="eyebrow">CHAPTER QUESTIONS</p><h1>按教材目录出题与审核</h1><p>先选择教材和章节，再勾选出题范围；题目依据来自该范围内已审核知识点。</p></div><div class="button-row"><input v-model.number="chapterQuestionCount" type="number" min="1" max="30" aria-label="生成题数" class="count-input" /><button class="primary" :disabled="busy || !selectedBook?.mapping_confirmed || !approvedChapterKnowledge.length || !headingSelectionReady" @click="generateChapterQuestions">按所选标题出题</button></div></div>
+          <div class="selector-row"><span>① 教材</span><select :value="bookId || ''" @change="loadBook(Number(($event.target as HTMLSelectElement).value))"><option v-for="b in books" :key="b.id" :value="b.id">{{ b.title }} · {{ b.page_count }} 页</option></select><span>② 章节</span><select v-model="selectedChapter" @change="onChapterChange"><option v-for="chapter in chapterNames" :key="chapter" :value="chapter">{{ chapter }}</option></select><span>{{ chapterQuestions.length }} 道题 · {{ approvedChapterKnowledge.length }} 条已审核知识点</span></div>
+          <div v-if="chapterOutline.length" class="panel"><div class="panel-head"><h2>③ 选择目录标题</h2><span>勾选大标题将自动包含下方所有小标题</span></div><div class="heading-tree"><label v-for="heading in chapterOutline" :key="heading.index" :style="{ paddingLeft: `${12 + (heading.level - chapterOutline[0].level) * 22}px` }"><input type="checkbox" :disabled="chapterOutline.length === 1" :checked="selectedHeadingIndices.includes(heading.index) || (chapterOutline.length === 1 && heading.index === chapterOutline[0].index)" @change="toggleHeading(heading.index, ($event.target as HTMLInputElement).checked)" /><strong>{{ heading.title }}</strong><small>PDF {{ heading.pdf_page }}</small></label></div><p v-if="chapterOutline.length > 1 && !selectedHeadingIndices.length" class="muted">请选择至少一个标题。选择章标题会包含整章。</p></div>
           <div class="two-col"><div class="panel"><div class="panel-head"><h2>本章试题</h2><span>{{ chapterQuestions.length }} 道</span></div>
             <div v-for="q in chapterQuestions" :key="q.id" class="record"><div class="record-top"><strong>#{{ q.id }} · {{ q.stem }}</strong><span class="badge" :class="q.status">{{ statusName(q.status) }}</span></div><div class="option-preview"><span v-for="key in ['A','B','C','D']" :key="key" :class="{ correct: q.answer === key }">{{ key }}. {{ q.options[key] }}</span></div><p class="muted">解析：{{ q.explanation }}</p><blockquote>{{ q.evidence }}</blockquote><div v-for="problem in q.validation" :key="problem" class="issue">{{ problem }}</div><div class="source-line"><span>知识点 #{{ q.knowledge_id }}</span><span>原文块 #{{ q.chunk_id }}</span><span>版本 {{ q.revision }}</span><span v-if="q.variant_of">变式自 #{{ q.variant_of }}</span></div><div class="button-row"><button class="text-btn" @click="chooseQuestion(q)">编辑</button><button v-if="isReviewer && q.status !== 'approved'" class="small success-btn" @click="reviewQuestion(q.id, true)">审核通过</button><button v-if="isReviewer && q.status !== 'rejected'" class="small danger-btn" @click="reviewQuestion(q.id, false)">退回</button></div></div><div v-if="!chapterQuestions.length" class="empty">本章尚无题目。先审核本章知识点，再生成题目。</div></div>
             <div class="panel form-panel"><h2>{{ questionEdit ? `编辑试题 #${questionEdit}` : '录入本章单选题' }}</h2><label>本章知识点<select v-model.number="questionForm.knowledge_id"><option v-for="k in approvedChapterKnowledge" :key="k.id" :value="k.id">#{{ k.id }} {{ k.title }}</option></select></label><label>题干<textarea v-model="questionForm.stem" rows="3"></textarea></label><label v-for="key in ['A','B','C','D']" :key="key">选项 {{ key }}<input v-model="questionForm.options[key]" /></label><div class="form-row"><label>正确答案<select v-model="questionForm.answer"><option v-for="key in ['A','B','C','D']" :key="key">{{ key }}</option></select></label><label>难度<select v-model="questionForm.difficulty"><option value="easy">简单</option><option value="medium">中等</option><option value="hard">困难</option></select></label></div><label>解析<textarea v-model="questionForm.explanation" rows="3"></textarea></label><label>原文依据<textarea v-model="questionForm.evidence" rows="3"></textarea></label><div class="button-row"><button class="primary" :disabled="busy || !approvedChapterKnowledge.length" @click="saveQuestion">保存并自动校验</button><button class="secondary" @click="chooseQuestion()">清空</button></div></div>

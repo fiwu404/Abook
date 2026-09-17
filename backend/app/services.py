@@ -4,6 +4,7 @@ import re
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .catalog import chapter_outline, expand_heading_indices, headings_for_chunks, normalized
 from .models import Audit, Chunk, Knowledge, Page, Question
 
 
@@ -47,6 +48,38 @@ def rebuild_chunks(db: Session, page: Page):
                      following=texts[index + 1][:500] if index + 1 < len(texts) else ""))
 
 
+def scoped_knowledge(db: Session, book, chapter: str, selected_heading_indices: list[int]) -> tuple[list[Knowledge], set[int]]:
+    """Keep approved knowledge whose original text block belongs to selected headings."""
+    selected = expand_heading_indices(book.toc, chapter, selected_heading_indices)
+    chunks = db.scalars(select(Chunk).join(Page, Chunk.page_id == Page.id).where(
+        Chunk.book_id == book.id, Chunk.chapter == chapter, Chunk.active.is_(True))
+        .order_by(Page.pdf_page, Chunk.position)).all()
+    pages = {page.id: page for page in db.scalars(select(Page).where(Page.book_id == book.id)).all()}
+    headings = headings_for_chunks(book.toc, chapter, chunks, pages)
+    by_chunk = {chunk.id: chunk for chunk in chunks}
+    outline = chapter_outline(book.toc, chapter)
+    candidates = db.scalars(select(Knowledge).where(
+        Knowledge.book_id == book.id, Knowledge.chapter == chapter,
+        Knowledge.status == "approved", Knowledge.chunk_id.in_(by_chunk)).order_by(Knowledge.id)).all()
+    knowledge = []
+    for item in candidates:
+        chunk = by_chunk[item.chunk_id]
+        heading = headings[chunk.id]
+        # OCR may put several headings and their text into one block. Locate the
+        # reviewed source quote inside that block before selecting its heading.
+        text = normalized(chunk.text)
+        quote_position = text.find(normalized(item.source_quote)) if item.source_quote else -1
+        if quote_position >= 0:
+            matches = [(text.find(normalized(entry["title"])), entry["index"]) for entry in outline
+                       if entry["pdf_page"] == pages[chunk.page_id].pdf_page]
+            preceding = [match for match in matches if 0 <= match[0] <= quote_position]
+            if preceding:
+                heading = max(preceding)[1]
+        if heading in selected:
+            knowledge.append(item)
+    return knowledge, selected
+
+
 def validate_question(db: Session, question: Question) -> list[str]:
     errors = []
     if not question.stem.strip():
@@ -67,6 +100,8 @@ def validate_question(db: Session, question: Question) -> list[str]:
         errors.append("知识点与原文出处不匹配")
     elif not question.evidence.strip() or question.evidence.strip() not in chunk.text:
         errors.append("依据必须逐字出现在原文内容块中")
+    elif not knowledge.source_quote or question.evidence.strip() not in knowledge.source_quote:
+        errors.append("依据必须逐字出现在知识点的原文摘录中")
     if knowledge and knowledge.status != "approved":
         errors.append("知识点尚未通过审核")
     fingerprint = hashlib.sha256(re.sub(r"\s+", "", question.stem).lower().encode()).hexdigest()

@@ -21,7 +21,7 @@ from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_
 from .db import Base, SessionLocal, engine, get_db, now
 from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
 from .security import bootstrap, check_password, current_user, hash_password, issue_token, roles
-from .services import audit, page_issues, question_public, question_snapshot, rebuild_chunks, validate_question
+from .services import audit, page_issues, question_public, question_snapshot, rebuild_chunks, scoped_knowledge, validate_question
 from .tasks import run_job
 
 
@@ -51,6 +51,7 @@ def out(value):
 def book_view(book: Book):
     data = out(book)
     data.pop("file_path", None)
+    data.pop("version", None)
     return data
 
 
@@ -260,13 +261,14 @@ def update_ai_config(data: AIConfigInput, user: User = Depends(roles("admin")), 
 
 
 @app.post("/api/books")
-async def upload_book(title: str, version: str, file: UploadFile = File(...),
+async def upload_book(title: str, file: UploadFile = File(...),
                       toc_pages: str = Form(""), manual_toc: str = Form(""),
                       user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "第一版仅支持 PDF")
-    if not title.strip() or not version.strip():
-        raise HTTPException(400, "教材名称和版本不能为空")
+    title = title.strip()
+    if not title:
+        raise HTTPException(400, "教材名称不能为空")
     maximum = int(os.getenv("MAX_PDF_BYTES", str(100 * 1024 * 1024)))
     body = await file.read(maximum + 1)
     if len(body) > maximum or not body.startswith(b"%PDF-"):
@@ -280,17 +282,17 @@ async def upload_book(title: str, version: str, file: UploadFile = File(...),
         entries = parse_manual_toc(manual_toc, page_count) if manual_toc.strip() else []
     except (ValueError, RuntimeError, pymupdf.FileDataError) as exc:
         raise HTTPException(400, f"PDF 或目录设置无效：{exc}") from exc
-    if db.scalar(select(Book).where(Book.title == title, Book.version == version)):
-        raise HTTPException(409, "教材名称与版本已存在")
     sha = hashlib.sha256(body).hexdigest()
+    if db.scalar(select(Book.id).where(Book.title == title, Book.sha256 == sha)):
+        raise HTTPException(409, "教材库中已有相同名称和 PDF 的教材")
     path = Path(os.getenv("UPLOAD_DIR", "./data/uploads")) / f"{sha}.pdf"
     path.write_bytes(body)
-    book = Book(title=title.strip(), version=version.strip(), sha256=sha, file_path=str(path),
+    book = Book(title=title, version=sha[:16], sha256=sha, file_path=str(path),
                 page_count=page_count, toc=entries, status="toc_review" if entries else "uploaded")
     db.add(book)
     db.flush()
     db.add(BookCatalog(book_id=book.id, toc_pages=hints, source="manual" if entries else "pending"))
-    audit(db, "book", book.id, user.id, "upload", after={"title": book.title, "version": book.version, "sha256": sha})
+    audit(db, "book", book.id, user.id, "upload", after={"title": book.title, "sha256": sha})
     db.commit()
     return book_view(book)
 
@@ -383,6 +385,12 @@ def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("adm
     if not validated:
         raise HTTPException(400, "目录至少需要一个章节")
     before = {"toc": book.toc}
+    if validated != book.toc:
+        for knowledge in db.scalars(select(Knowledge).where(Knowledge.book_id == book_id)).all():
+            knowledge.status = "needs_review"
+        for question in db.scalars(select(Question).join(Knowledge, Question.knowledge_id == Knowledge.id)
+                                   .where(Knowledge.book_id == book_id)).all():
+            question.status = "needs_review"
     book.toc = validated
     catalog = db.get(BookCatalog, book_id)
     if not catalog:
@@ -537,6 +545,7 @@ def extract_knowledge(book_id: int, data: ChapterRequest, user: User = Depends(r
 
 class ChapterQuestionsInput(ChapterRequest):
     count: int = Field(ge=1, le=30)
+    selected_heading_indices: list[int] = Field(default_factory=list)
 
 
 @app.post("/api/books/{book_id}/generate-chapter-questions")
@@ -545,16 +554,21 @@ def generate_chapter_questions(book_id: int, data: ChapterQuestionsInput,
     book = require(db.get(Book, book_id))
     if not book.mapping_confirmed or data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
         raise HTTPException(400, "请先确认目录与章节，并选择一个有效章节")
-    approved = db.scalar(select(func.count(Knowledge.id)).where(Knowledge.book_id == book_id,
-                        Knowledge.chapter == data.chapter, Knowledge.status == "approved", Knowledge.chunk_id.is_not(None))) or 0
-    if not approved:
-        raise HTTPException(400, "本章尚无已审核的教材知识点")
+    if not data.selected_heading_indices:
+        raise HTTPException(400, "请先选择出题目录标题")
+    selected_indices = data.selected_heading_indices
+    try:
+        eligible, expanded = scoped_knowledge(db, book, data.chapter, selected_indices)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not eligible:
+        raise HTTPException(400, "所选目录标题下没有已审核且绑定原文的知识点；请先总结并审核该范围")
     existing = db.scalar(select(func.count(Question.id)).join(Knowledge, Question.knowledge_id == Knowledge.id).where(
         Knowledge.book_id == book_id, Knowledge.chapter == data.chapter)) or 0
-    chapter_key = hashlib.sha256(data.chapter.encode()).hexdigest()[:12]
+    chapter_key = hashlib.sha256(json.dumps([data.chapter, sorted(expanded)], ensure_ascii=False).encode()).hexdigest()[:12]
     return out(enqueue(db, "chapter_questions", book_id,
-        f"chapter_questions:{book_id}:{chapter_key}:{approved}:{existing}:{data.count}",
-        {"chapter": data.chapter, "count": data.count}))
+        f"chapter_questions:{book_id}:{chapter_key}:{len(eligible)}:{existing}:{data.count}",
+        {"chapter": data.chapter, "count": data.count, "selected_heading_indices": selected_indices}))
 
 
 @app.get("/api/books/{book_id}/knowledge")

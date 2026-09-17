@@ -5,10 +5,10 @@ from celery import Celery
 from sqlalchemy import select
 
 from .ai import ocr_png, structured, vision_json
-from .catalog import chapter_entries, chapter_for_page, discover_catalog, normalized
+from .catalog import chapter_entries, chapter_for_page, chapter_outline, discover_catalog, normalized
 from .db import SessionLocal
 from .models import Book, BookCatalog, Chunk, Job, Knowledge, Page, Question
-from .services import page_issues, rebuild_chunks, validate_question
+from .services import page_issues, rebuild_chunks, scoped_knowledge, validate_question
 
 
 celery_app = Celery("abook", broker=os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"))
@@ -41,7 +41,7 @@ def _toc(db, job):
                      for level, title, page in pdf.get_toc() if 1 <= page <= len(pdf)]
         if bookmarks:
             from .catalog import validate_toc
-            toc = validate_toc(chapter_entries(bookmarks), len(pdf))
+            toc = validate_toc(bookmarks, len(pdf))
             pages, raw, warnings, source = [], "", [], "bookmarks"
         else:
             toc, pages, raw, warnings = discover_catalog(pdf, catalog.toc_pages if catalog else [], vision_json)
@@ -190,7 +190,7 @@ def _knowledge(db, job):
         db.commit()
 
 
-def _create_question(db, knowledge: Knowledge, variant_of=None):
+def _create_question(db, knowledge: Knowledge, variant_of=None, scope_titles: list[str] | None = None):
     if not knowledge or knowledge.status != "approved" or not knowledge.chunk_id:
         raise RuntimeError("仅可从已审核、绑定教材原文的知识点出题")
     chunk = db.get(Chunk, knowledge.chunk_id)
@@ -199,8 +199,10 @@ def _create_question(db, knowledge: Knowledge, variant_of=None):
         raise RuntimeError("教材内容已变更，请重新审核知识点")
     original = db.get(Question, variant_of) if variant_of else None
     variation = ("与原题考察相同知识点，但题干和选项不同。原题：" + original.stem + "\n") if original else ""
+    source = knowledge.source_quote if scope_titles else chunk.text[:5000]
+    scope = ("所选目录标题：" + "、".join(scope_titles[:20]) + "。仅使用下方知识点逐字摘录作为依据。") if scope_titles else ""
     data = structured("仅根据教材章节《" + knowledge.chapter + "》的已审核知识点生成 1 道单选题。" + variation +
-        "不得引用其他章节，也不要按 PDF 页码出题。返回 JSON：{\"stem\":\"\",\"options\":{\"A\":\"\",\"B\":\"\",\"C\":\"\",\"D\":\"\"},\"answer\":\"A\",\"explanation\":\"\",\"evidence\":\"原文连续摘录\",\"difficulty\":\"easy|medium|hard\"}。只考教材范围，只有一个正确答案。答案依据必须逐字来自下列原文块。\n知识点：" + knowledge.title + " " + knowledge.content + "\n本章原文块：" + chunk.text[:5000])
+        scope + "不得引用其他章节，也不要按 PDF 页码出题。返回 JSON：{\"stem\":\"\",\"options\":{\"A\":\"\",\"B\":\"\",\"C\":\"\",\"D\":\"\"},\"answer\":\"A\",\"explanation\":\"\",\"evidence\":\"原文连续摘录\",\"difficulty\":\"easy|medium|hard\"}。只考教材范围，只有一个正确答案。答案依据必须逐字来自下列原文。\n知识点：" + knowledge.title + " " + knowledge.content + "\n教材原文：" + source)
     question = Question(knowledge_id=knowledge.id, chunk_id=chunk.id,
                         stem=str(data.get("stem", "")), options=data.get("options", {}),
                         answer=str(data.get("answer", "")), explanation=str(data.get("explanation", "")),
@@ -230,17 +232,18 @@ def _chapter_questions(db, job):
     chapter = (job.payload or {}).get("chapter", "")
     if chapter not in {item["title"] for item in chapter_entries(book.toc)}:
         raise RuntimeError("请选择目录中的一个章节")
-    knowledge = db.scalars(select(Knowledge).where(Knowledge.book_id == book.id,
-        Knowledge.chapter == chapter, Knowledge.status == "approved", Knowledge.chunk_id.is_not(None)).order_by(Knowledge.id)).all()
+    outline = chapter_outline(book.toc, chapter)
+    selected = (job.payload or {}).get("selected_heading_indices") or [outline[0]["index"]]
+    knowledge, _ = scoped_knowledge(db, book, chapter, selected)
     if not knowledge:
-        raise RuntimeError("本章尚无已审核且有原文出处的知识点")
+        raise RuntimeError("所选目录标题下没有已审核且有原文出处的知识点")
     count = int((job.payload or {}).get("count", 1))
     job.total = count
     db.commit()
     for index in range(count):
         if not _check(db, job):
             return
-        _create_question(db, knowledge[index % len(knowledge)])
+        _create_question(db, knowledge[index % len(knowledge)], scope_titles=[book.toc[item]["title"] for item in selected])
         job.progress = index + 1
         db.commit()
 

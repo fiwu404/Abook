@@ -7,6 +7,7 @@ import pymupdf
 
 CHAPTER = re.compile(r"^(项目\s*\d+|任务\s*\d+|模块\s*\d+|第\s*[一二三四五六七八九十百0-9]+\s*(?:章|单元)|Chapter\s+\d+|Unit\s+\d+)\s*(.*)$", re.I)
 PAGE_LEADER = re.compile(r"^(.+?)[.．·…]{3,}\s*(\d+)\s*$", re.M)
+SECTION = re.compile(r"^(\d+(?:[.．]\d+)+)\s+(.+)$")
 TOC_HEADING = re.compile(r"(^|\n)\s*(目\s*录|contents|table of contents)\b", re.I)
 
 
@@ -46,11 +47,12 @@ def validate_toc(items: list[dict], page_count: int) -> list[dict]:
         if not title or not 1 <= level <= 8 or not 1 <= page <= page_count:
             raise ValueError("目录标题、层级或 PDF 起始页无效")
         result.append({"level": level, "title": title, "pdf_page": page})
-    if len(result) > 500 or len({item["title"] for item in result}) != len(result):
-        raise ValueError("目录条目过多或章节标题重复，请为重复章节添加编号")
+    if len(result) > 500:
+        raise ValueError("目录条目不能超过 500 条")
     result.sort(key=lambda item: item["pdf_page"])
-    if any(result[i]["pdf_page"] > result[i + 1]["pdf_page"] for i in range(len(result) - 1)):
-        raise ValueError("目录页码顺序无效")
+    chapters = chapter_entries(result)
+    if len({item["title"] for item in chapters}) != len(chapters):
+        raise ValueError("章/项目标题重复，请添加编号")
     return result
 
 
@@ -73,13 +75,66 @@ def chapter_entries(toc: list[dict]) -> list[dict]:
         return []
     named = [item for item in toc if CHAPTER.match(item["title"])]
     if named:
-        return named
+        level = min(item["level"] for item in named)
+        return [item for item in named if item["level"] == level]
     level = min(item["level"] for item in toc)
     return [item for item in toc if item["level"] == level]
 
 
 def chapter_for_page(toc: list[dict], pdf_page: int) -> str:
     return next((item["title"] for item in reversed(chapter_entries(toc)) if item["pdf_page"] <= pdf_page), "前置内容")
+
+
+def chapter_outline(toc: list[dict], chapter: str) -> list[dict]:
+    """Return the selected chapter and its descendants with stable TOC indices."""
+    chapter_ids = {id(item) for item in chapter_entries(toc)}
+    roots = {index for index, item in enumerate(toc) if id(item) in chapter_ids}
+    start = next((index for index in roots if toc[index]["title"] == chapter), None)
+    if start is None:
+        return []
+    stop = next((index for index in range(start + 1, len(toc)) if index in roots), len(toc))
+    root_level = toc[start]["level"]
+    return [{**toc[index], "index": index} for index in range(start, stop)
+            if index == start or toc[index]["level"] > root_level]
+
+
+def expand_heading_indices(toc: list[dict], chapter: str, selected: list[int]) -> set[int]:
+    outline = chapter_outline(toc, chapter)
+    allowed = {item["index"] for item in outline}
+    if not outline or not selected or any(index not in allowed for index in selected):
+        raise ValueError("请选择当前章节中的目录标题")
+    expanded = set(selected)
+    positions = {item["index"]: offset for offset, item in enumerate(outline)}
+    for index in selected:
+        position = positions[index]
+        level = outline[position]["level"]
+        for item in outline[position + 1:]:
+            if item["level"] <= level:
+                break
+            expanded.add(item["index"])
+    return expanded
+
+
+def headings_for_chunks(toc: list[dict], chapter: str, chunks: list, pages: dict) -> dict[int, int]:
+    """Assign text blocks to TOC headings, using visible headings at shared page boundaries."""
+    outline = chapter_outline(toc, chapter)
+    if not outline:
+        return {}
+    current = outline[0]["index"]
+    result = {}
+    previous_page = None
+    for chunk in chunks:
+        pdf_page = pages[chunk.page_id].pdf_page
+        if pdf_page != previous_page:
+            earlier = [item for item in outline if item["pdf_page"] < pdf_page]
+            current = earlier[-1]["index"] if earlier else outline[0]["index"]
+            previous_page = pdf_page
+        text = normalized(chunk.text)
+        for item in outline:
+            if item["pdf_page"] == pdf_page and normalized(item["title"]) in text:
+                current = item["index"]
+        result[chunk.id] = current
+    return result
 
 
 def parse_toc_text(text: str) -> list[dict]:
@@ -98,8 +153,14 @@ def parse_toc_text(text: str) -> list[dict]:
         if pending:
             title = clean_title(f"{pending} {title}")
             pending = ""
-        if CHAPTER.match(title) and title and printed > 0:
-            entries.append({"level": 1, "title": title, "printed_page": printed})
+        section = SECTION.match(title)
+        if title and printed > 0 and (CHAPTER.match(title) or section):
+            level = 1 if CHAPTER.match(title) else min(8, section.group(1).replace("．", ".").count(".") + 1)
+            entries.append({"level": level, "title": title, "printed_page": printed})
+    if any(entry["title"].startswith("项目") for entry in entries):
+        for entry in entries:
+            if entry["title"].startswith("任务"):
+                entry["level"] = 2
     return entries
 
 
@@ -148,34 +209,40 @@ def discover_catalog(pdf: pymupdf.Document, hints: list[int], vision) -> tuple[l
         extracted = []
         for number in pages:
             image = pdf[number - 1].get_pixmap(matrix=pymupdf.Matrix(1.6, 1.6)).tobytes("png")
-            result = vision(image, "提取目录中的章/项目级条目，不要提取小节。返回 {\"items\":[{\"title\":\"完整章标题\",\"printed_page\":1}]}。目录页上的页码是印刷页码。")
+            result = vision(image, "按顺序提取目录中的章/项目及所有小节标题。返回 {\"items\":[{\"level\":1,\"title\":\"完整标题\",\"printed_page\":1}]}。章/项目为 level 1，其下小节为 level 2，再下一级为 level 3。目录页上的页码是印刷页码。")
             extracted.extend(result.get("items", []))
         for item in extracted:
             title = clean_title(str(item.get("title", "")))
             number = item.get("printed_page")
             if title and str(number).isdigit():
-                entries.append({"level": 1, "title": title, "printed_page": int(number)})
+                entries.append({"level": max(1, min(8, int(item.get("level", 1)))), "title": title, "printed_page": int(number)})
     unique = {}
     for entry in entries:
-        unique.setdefault(normalized(entry["title"]), entry)
+        unique.setdefault((normalized(entry["title"]), entry["printed_page"], entry["level"]), entry)
     entries = list(unique.values())
     if not entries:
         raise RuntimeError("目录页已找到，但未识别出章/项目条目；请在目录编辑区人工录入")
-    body_texts = [normalized(pdf[index].get_text()[:1200]) if index + 1 not in pages else "" for index in range(len(pdf))]
-    matched = []
+    body_texts = [normalized(pdf[index].get_text()[:2000]) if index + 1 not in pages else "" for index in range(len(pdf))]
+    major_matches = []
     for entry in entries:
+        if entry["level"] != 1:
+            continue
         title = normalized(entry["title"])
         body_page = next((index + 1 for index, text in enumerate(body_texts) if title and title in text), None)
-        entry["matched_page"] = body_page
         if body_page:
-            matched.append(body_page - entry["printed_page"])
-    offset = round(median(matched)) if matched else max(pages)
-    if not matched:
+            major_matches.append(body_page - entry["printed_page"])
+    offset = round(median(major_matches)) if major_matches else max(pages)
+    if not major_matches:
         warnings.append("目录页码与 PDF 页码的偏移未核实，请逐条校对起始页")
     result = []
     for entry in entries:
+        title = normalized(entry["title"])
+        expected = entry["printed_page"] + offset
+        candidates = [index + 1 for index, text in enumerate(body_texts) if title and title in text]
+        entry["matched_page"] = min(candidates, key=lambda page: abs(page - expected)) if candidates else None
         page = entry["matched_page"] or entry["printed_page"] + offset
         if not entry["matched_page"]:
-            warnings.append(f"{entry['title']} 未在正文中找到标题，起始页为推算值")
-        result.append({"level": 1, "title": entry["title"], "pdf_page": min(max(1, page), len(pdf))})
+            if entry["level"] == 1:
+                warnings.append(f"{entry['title']} 未在正文中找到标题，起始页为推算值")
+        result.append({"level": entry["level"], "title": entry["title"], "pdf_page": min(max(1, page), len(pdf))})
     return validate_toc(result, len(pdf)), pages, raw[:30000], warnings

@@ -21,7 +21,7 @@ from app.db import SessionLocal, now  # noqa: E402
 from app.main import app  # noqa: E402
 from app.tasks import celery_app  # noqa: E402
 from app import ai  # noqa: E402
-from app.catalog import parse_toc_text  # noqa: E402
+from app.catalog import chapter_entries, expand_heading_indices, parse_toc_text  # noqa: E402
 from app.models import BookCatalog, Page  # noqa: E402
 
 
@@ -56,12 +56,14 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         student = headers(client, "student_one", "student1234")
         teacher = headers(client, "teacher_one", "teacher1234")
         assert client.get("/api/users", headers=teacher).status_code == 403
-        book = ok(client.post("/api/books?title=Biology&version=1", headers=operator,
+        book = ok(client.post("/api/books?title=Biology", headers=operator,
                               files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")},
                               data={"manual_toc": "1|Unit 1|1"}))
-        assert client.post("/api/books?title=Other&version=1", headers=teacher,
+        assert "version" not in book
+        assert client.post("/api/books?title=Other", headers=teacher,
                            files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")}).status_code == 403
-        assert book["version"] == "1"
+        assert client.post("/api/books?title=Biology", headers=operator,
+                           files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")}).status_code == 409
         ok(client.post(f"/api/books/{book['id']}/confirm-toc", headers=operator))
         job = ok(client.post(f"/api/books/{book['id']}/parse", headers=operator))
         assert ok(client.get("/api/jobs", headers=operator))[0]["status"] == "done"
@@ -201,7 +203,7 @@ def test_directory_first_and_on_demand_chapter_workflow(monkeypatch):
     monkeypatch.setattr("app.tasks.ocr_png", lambda png: "前置内容")
     with TestClient(app) as client:
         admin = headers(client, "admin", "admin12345678")
-        book = ok(client.post("/api/books?title=Cloud%20Guide&version=1", headers=admin,
+        book = ok(client.post("/api/books?title=Cloud%20Guide", headers=admin,
                               files={"file": ("cloud.pdf", io.BytesIO(body), "application/pdf")}))
         assert not book["toc"]
         # Simulate a textbook imported by the old page-first parser.
@@ -218,6 +220,7 @@ def test_directory_first_and_on_demand_chapter_workflow(monkeypatch):
         assert [item["pdf_page"] for item in catalog["chapters"]] == [4, 6]
         assert catalog["toc_pages"] == [2, 3]
         assert [item["title"] for item in catalog["chapters"]] == ["Chapter 1 Cloud Basics", "Chapter 2 Storage Basics"]
+        assert [item["level"] for item in catalog["toc"]] == [1, 2, 2, 1, 2, 2]
         assert catalog["confirmed"] is False
         ok(client.post(f"/api/books/{book['id']}/confirm-toc", headers=admin))
         parsed = ok(client.post(f"/api/books/{book['id']}/parse", headers=admin))
@@ -244,9 +247,78 @@ def test_directory_first_and_on_demand_chapter_workflow(monkeypatch):
             "answer": "A", "explanation": "The chapter describes compute resources as services.",
             "evidence": quote, "difficulty": "easy"})
         question_job = ok(client.post(f"/api/books/{book['id']}/generate-chapter-questions", headers=admin,
-                                       json={"chapter": "Chapter 1 Cloud Basics", "count": 1}))
+                                       json={"chapter": "Chapter 1 Cloud Basics", "count": 1,
+                                             "selected_heading_indices": [0]}))
         assert question_job["status"] == "done"
         questions = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
         assert len(questions) == 1 and questions[0]["validation"] == []
         assert client.post(f"/api/books/{book['id']}/extract-knowledge", headers=admin,
                            json={"chapter": "前置内容"}).status_code == 400
+
+
+def test_textbook_library_and_heading_scoped_questions(monkeypatch):
+    assert [item["title"] for item in chapter_entries([
+        {"level": 1, "title": "项目1 网络", "pdf_page": 1},
+        {"level": 2, "title": "任务1 配置设备", "pdf_page": 1},
+    ])] == ["项目1 网络"]
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Chapter 7 Networks\n7.1 Network models\n7.1.1 Layered model\n"
+                     "Layered networks separate responsibilities.\n7.2 Network devices\nSwitches connect local devices.")
+    body = document.tobytes()
+    document.close()
+    monkeypatch.setattr("app.tasks.vision_json", lambda png, prompt: {"chapter": "Chapter 7 Networks", "confidence": "high"})
+    toc = "1|Chapter 7 Networks|1\n2|7.1 Network models|1\n3|7.1.1 Layered model|1\n2|7.2 Network devices|1"
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        book = ok(client.post("/api/books?title=Network%20Textbook", headers=admin,
+                              files={"file": ("networks.pdf", io.BytesIO(body), "application/pdf")},
+                              data={"manual_toc": toc}))
+        assert any(item["id"] == book["id"] for item in ok(client.get("/api/books", headers=admin)))
+        catalog = ok(client.get(f"/api/books/{book['id']}/catalog", headers=admin))
+        assert [item["level"] for item in catalog["toc"]] == [1, 2, 3, 2]
+        assert expand_heading_indices(catalog["toc"], "Chapter 7 Networks", [1]) == {1, 2}
+        ok(client.post(f"/api/books/{book['id']}/confirm-toc", headers=admin))
+        ok(client.post(f"/api/books/{book['id']}/parse", headers=admin))
+        ok(client.post(f"/api/books/{book['id']}/confirm-mapping", headers=admin))
+        sections = ok(client.get(f"/api/books/{book['id']}/learning", headers=admin))["sections"]
+        first = next(item for item in sections if "Layered networks" in item["text"])
+        second = next(item for item in sections if "Switches connect" in item["text"])
+        created_knowledge = []
+        for chunk, title, quote in [(first, "Layers", "Layered networks separate responsibilities."),
+                                    (second, "Switches", "Switches connect local devices.")]:
+            knowledge = ok(client.post(f"/api/books/{book['id']}/knowledge", headers=admin, json={
+                "title": title, "content": quote, "chunk_id": chunk["chunk_id"],
+                "source_quote": quote, "chapter": "Chapter 7 Networks"}))
+            created_knowledge.append(knowledge)
+            ok(client.post(f"/api/knowledge/{knowledge['id']}/review", headers=admin, json={"approve": True}))
+        bad = ok(client.post("/api/questions", headers=admin, json={
+            "knowledge_id": created_knowledge[0]["id"], "stem": "Which devices connect?",
+            "options": {"A": "Switches", "B": "Routers", "C": "Books", "D": "Plants"},
+            "answer": "A", "explanation": "The device statement is on the same page.",
+            "evidence": "Switches connect local devices.", "difficulty": "easy"}))
+        assert "依据必须逐字出现在知识点的原文摘录中" in bad["validation"]
+        assert client.post(f"/api/questions/{bad['id']}/review", headers=admin, json={"approve": True}).status_code == 400
+        def generate(prompt):
+            quote = "Switches connect local devices." if "知识点：Switches" in prompt else "Layered networks separate responsibilities."
+            return {"stem": f"Which fact is in the textbook: {quote}",
+                    "options": {"A": quote, "B": "Other", "C": "Another", "D": "None"},
+                    "answer": "A", "explanation": "The original text states this fact.",
+                    "evidence": quote, "difficulty": "easy"}
+        monkeypatch.setattr("app.tasks.structured", generate)
+        assert client.post(f"/api/books/{book['id']}/generate-chapter-questions", headers=admin,
+                           json={"chapter": "Chapter 7 Networks", "count": 1,
+                                 "selected_heading_indices": [99]}).status_code == 400
+        job = ok(client.post(f"/api/books/{book['id']}/generate-chapter-questions", headers=admin,
+                             json={"chapter": "Chapter 7 Networks", "count": 1,
+                                   "selected_heading_indices": [1]}))
+        assert job["status"] == "done"
+        questions = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
+        assert any(item["evidence"] == "Layered networks separate responsibilities." for item in questions)
+        job = ok(client.post(f"/api/books/{book['id']}/generate-chapter-questions", headers=admin,
+                             json={"chapter": "Chapter 7 Networks", "count": 1,
+                                   "selected_heading_indices": [3]}))
+        assert job["status"] == "done"
+        questions = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
+        assert {item["evidence"] for item in questions} == {
+            "Layered networks separate responsibilities.", "Switches connect local devices."}
