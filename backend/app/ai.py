@@ -208,12 +208,10 @@ def test_model(provider: ModelProvider, model: str, vision: bool = False) -> dic
         page.insert_text((12, 40), "TEST 123", fontsize=18)
         png = page.get_pixmap().tobytes("png")
         document.close()
-        content = [{"type": "text", "text": "读出图中文字，只返回 JSON：{\"text\":\"识别出的文字\"}。"},
+        content = [{"type": "text", "text": "读出图中文字，只返回识别出的文字。"},
                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}}]
     else:
         content = "请只回复 OK。"
     start = time.monotonic()
-    reply = _request(provider, model, [{"role": "user", "content": content}], json_mode=vision, timeout=60)
-    if vision:
-        _json_object(reply)
+    reply = _request(provider, model, [{"role": "user", "content": content}], timeout=60)
     return {"ok": True, "latency_ms": round((time.monotonic() - start) * 1000), "reply": reply[:160]}

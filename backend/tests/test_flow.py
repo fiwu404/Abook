@@ -277,6 +277,23 @@ def test_ollama_vision_json_parser_failure_falls_back(monkeypatch):
     document.close()
 
 
+def test_ollama_ocr_model_test_accepts_plain_text(monkeypatch):
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        assert "response_format" not in payload
+        return httpx.Response(200, json={"choices": [{"message": {"content": "TEST 123"}}]})
+
+    monkeypatch.setattr(ai, "_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(respond), timeout=timeout))
+    provider = ModelProvider(display_name="本机 Ollama", base_url="http://127.0.0.1:11434/v1", api_style="ollama")
+    result = ai.test_model(provider, "qwen3-vl:4b", vision=True)
+    assert result["ok"] is True and result["reply"] == "TEST 123"
+    assert len(requests) == 1
+    assert requests[0]["messages"][0]["content"][1]["type"] == "image_url"
+
+
 def test_directory_first_and_on_demand_chapter_workflow(monkeypatch):
     assert parse_toc_text("目录 CONTENTS\n项目1\n初识云计算与OpenStack 云计算平台........2")[0] == {
         "level": 1, "title": "项目1 初识云计算与OpenStack 云计算平台", "printed_page": 2}
@@ -447,6 +464,18 @@ def test_textbook_library_and_heading_scoped_questions(monkeypatch):
             "answer": "A", "explanation": "Manual check", "evidence": "", "difficulty": "easy"}))
         assert client.post(f"/api/questions/{structurally_bad['id']}/review", headers=admin,
                            json={"approve": True}).status_code == 400
+        exact_rule = {"book_id": book["id"], "title": "Selected question", "chapter": "Chapter 7 Networks",
+                      "question_ids": [bad["id"]], "question_count": 1, "score_each": 10, "difficulty": "easy"}
+        exact_paper = ok(client.post("/api/papers", headers=admin, json=exact_rule))
+        assert exact_paper["rule"]["question_ids"] == [bad["id"]]
+        assert exact_paper["rule"]["knowledge_ids"] == [created_knowledge[0]["id"]]
+        assert exact_paper["total_score"] == 10
+        assert client.post("/api/papers", headers=admin, json={**exact_rule,
+                           "question_ids": [structurally_bad["id"]]}).status_code == 400
+        assert client.post("/api/papers", headers=admin, json={**exact_rule,
+                           "question_ids": [bad["id"], bad["id"]], "question_count": 2}).status_code == 400
+        assert client.post("/api/papers", headers=admin, json={**exact_rule,
+                           "difficulty": "hard"}).status_code == 400
         paper = ok(client.post("/api/papers", headers=admin, json={
             "book_id": book["id"], "title": "Manual source review", "chapter": "Chapter 7 Networks",
             "knowledge_ids": [created_knowledge[0]["id"]], "question_count": 1,
@@ -530,3 +559,61 @@ def test_admin_can_clear_finished_job_list_without_losing_task_records(monkeypat
         with SessionLocal() as db:
             assert enqueue(db, "parse", 0, "cleanup:done").id == ids["done"]
         assert ids["done"] in {job["id"] for job in ok(client.get("/api/jobs", headers=admin))}
+
+
+def test_figure_question_shows_original_pdf_page_in_review_and_exam(monkeypatch):
+    monkeypatch.setattr("app.tasks.vision_json", lambda png, prompt: {"chapter": "Figures", "confidence": "high"})
+    document = pymupdf.open()
+    page = document.new_page(width=320, height=220)
+    page.draw_rect(pymupdf.Rect(72, 95, 230, 150), color=(0, 0, 0), fill=(0.7, 0.85, 1))
+    page.insert_text((72, 70), "A network diagram shows three nodes.")
+    body = document.tobytes()
+    document.close()
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        ok(client.post("/api/users", headers=admin, json={
+            "username": "student_figure", "password": "student1234", "role": "student"}))
+        student = headers(client, "student_figure", "student1234")
+        book = ok(client.post("/api/books?title=Figure%20Textbook", headers=admin,
+                              files={"file": ("figures.pdf", io.BytesIO(body), "application/pdf")},
+                              data={"manual_toc": "1|Figures|1"}))
+        ok(client.post(f"/api/books/{book['id']}/confirm-toc", headers=admin))
+        ok(client.post(f"/api/books/{book['id']}/parse", headers=admin))
+        ok(client.post(f"/api/books/{book['id']}/confirm-mapping", headers=admin))
+        chunk_id = ok(client.get(f"/api/books/{book['id']}/learning", headers=admin))["sections"][0]["chunk_id"]
+        knowledge = ok(client.post(f"/api/books/{book['id']}/knowledge", headers=admin, json={
+            "title": "Diagram", "content": "Three nodes are shown.", "chunk_id": chunk_id,
+            "source_quote": "A network diagram shows three nodes.", "chapter": "Figures"}))
+        ok(client.post(f"/api/knowledge/{knowledge['id']}/review", headers=admin, json={"approve": True}))
+        question = ok(client.post("/api/questions", headers=admin, json={
+            "knowledge_id": knowledge["id"], "stem": "图6-3 展示了什么？",
+            "options": {"A": "Three nodes", "B": "A router", "C": "A cloud", "D": "A server"},
+            "answer": "A", "explanation": "The source names three nodes.",
+            "evidence": "A network diagram shows three nodes.", "difficulty": "easy"}))
+        ok(client.post(f"/api/questions/{question['id']}/review", headers=admin, json={"approve": True}))
+        reviewed = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
+        assert reviewed[0]["image_pdf_page"] == 1
+        assert client.get(f"/api/books/{book['id']}/pages/1/image", headers=student).content.startswith(b"\x89PNG")
+        paper = ok(client.post("/api/papers", headers=admin, json={
+            "book_id": book["id"], "title": "Figure exam", "chapter": "Figures",
+            "question_ids": [question["id"]], "question_count": 1,
+            "score_each": 10, "difficulty": "easy"}))
+        start = now() - timedelta(minutes=1)
+        end = now() + timedelta(minutes=30)
+        published = ok(client.post(f"/api/papers/{paper['id']}/publish", headers=admin,
+                                   json={"starts_at": start.isoformat(), "ends_at": end.isoformat()}))
+        assert published["snapshot"][0]["image_pdf_page"] == 1
+        with SessionLocal() as db:
+            saved = db.get(Paper, paper["id"])
+            saved.snapshot = [{key: value for key, value in item.items() if key != "image_pdf_page"}
+                              for item in saved.snapshot]
+            db.commit()
+        attempt = ok(client.post(f"/api/papers/{paper['id']}/start", headers=student))
+        assert attempt["book_id"] == book["id"] and attempt["questions"][0]["image_pdf_page"] == 1
+        ok(client.put(f"/api/attempts/{attempt['id']}/answer", headers=student,
+                      json={"question_id": question["id"], "answer": "B"}))
+        ok(client.post(f"/api/attempts/{attempt['id']}/submit", headers=student))
+        result = ok(client.get(f"/api/attempts/{attempt['id']}", headers=student))
+        assert result["result"][0]["image_pdf_page"] == 1
+        ok(client.delete(f"/api/books/{book['id']}", headers=admin))
+        assert client.get(f"/api/books/{book['id']}/pages/1/image", headers=student).content.startswith(b"\x89PNG")

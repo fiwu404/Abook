@@ -175,12 +175,22 @@ def blocking_question_errors(errors: list[str]) -> list[str]:
     return [error for error in errors if error not in SOURCE_VALIDATION_WARNINGS]
 
 
+def question_image_page(db: Session, stem: str, chunk_id: int | None) -> int | None:
+    """Show the immutable source PDF page when a question refers to a figure."""
+    if not chunk_id or not re.search(r"图\s*\d+(?:[-－—.]\d+)*|下图|上图|如图|图中|图示|插图|图片|示意图|流程图", stem):
+        return None
+    chunk = db.get(Chunk, chunk_id)
+    page = db.get(Page, chunk.page_id) if chunk else None
+    return page.pdf_page if page else None
+
+
 def question_public(question: Question):
     return {"id": question.id, "stem": question.stem, "options": question.options,
             "difficulty": question.difficulty, "knowledge_id": question.knowledge_id}
 
 
-def question_snapshot(question: Question, score: int):
+def question_snapshot(question: Question, score: int, image_pdf_page: int | None = None):
     return {**question_public(question), "answer": question.answer,
             "explanation": question.explanation, "evidence": question.evidence,
-            "chunk_id": question.chunk_id, "revision": question.revision, "score": score}
+            "chunk_id": question.chunk_id, "revision": question.revision, "score": score,
+            "image_pdf_page": image_pdf_page}

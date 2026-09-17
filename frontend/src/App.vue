@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, setToken, token } from './api'
+import { api, apiBlob, setToken, token } from './api'
 
 const user = ref<any>(null)
 const auth = ref({ username: '', password: '' })
@@ -29,6 +29,9 @@ const learning = ref<any>(null)
 const knowledge = ref<any[]>([])
 const questions = ref<any[]>([])
 const jobs = ref<any[]>([])
+const sourceImages = ref<Record<string, string>>({})
+const sourceImageErrors = ref<Record<string, string>>({})
+const pendingSourceImages = new Set<string>()
 const papers = ref<any[]>([])
 const attempts = ref<any[]>([])
 const mastery = ref<Record<string, any>>({})
@@ -48,7 +51,7 @@ const knowledgeEdit = ref<number | null>(null)
 const knowledgeForm = ref<any>({ title: '', content: '', chunk_id: null, source_quote: '', chapter: '' })
 const questionEdit = ref<number | null>(null)
 const questionForm = ref<any>({ knowledge_id: 0, stem: '', options: { A: '', B: '', C: '', D: '' }, answer: 'A', explanation: '', evidence: '', difficulty: 'medium', variant_of: null })
-const paperForm = ref<any>({ title: '', knowledge_ids: [], question_count: 1, score_each: 10, difficulty: 'any' })
+const paperForm = ref<any>({ title: '', question_ids: [], score_each: 10, difficulty: 'any' })
 const publishStart = ref('')
 const publishEnd = ref('')
 const paperTimeEdit = ref<number | null>(null)
@@ -67,8 +70,14 @@ const chapterPages = computed(() => pages.value.filter(p => p.chapter === select
 const chapterSections = computed(() => (learning.value?.sections || []).filter((s: any) => s.chapter === selectedChapter.value))
 const chapterKnowledge = computed(() => knowledge.value.filter(k => k.chapter === selectedChapter.value))
 const chapterQuestions = computed(() => questions.value.filter(q => knowledge.value.find(k => k.id === q.knowledge_id)?.chapter === selectedChapter.value))
+const approvedPaperQuestions = computed(() => chapterQuestions.value.filter(q => q.status === 'approved' && knowledge.value.some(k => k.id === q.knowledge_id && k.status === 'approved')))
+const paperCandidateQuestions = computed(() => approvedPaperQuestions.value.filter(q => paperForm.value.difficulty === 'any' || q.difficulty === paperForm.value.difficulty))
 const approvedChapterKnowledge = computed(() => approvedKnowledge.value.filter(k => k.chapter === selectedChapter.value))
 const questionSource = computed(() => approvedChapterKnowledge.value.find(k => k.id === questionForm.value.knowledge_id)?.source_quote || '')
+const questionSourcePage = computed<number | null>(() => {
+  const chunkId = knowledge.value.find(k => k.id === questionForm.value.knowledge_id)?.chunk_id
+  return chapterSections.value.find((section: any) => section.chunk_id === chunkId)?.pdf_page || null
+})
 const visiblePapers = computed(() => isStaff.value ? papers.value : papers.value.filter(p => p.book_id === bookId.value))
 const chapterOutline = computed<any[]>(() => {
   const toc = catalog.value?.toc || []
@@ -111,7 +120,47 @@ async function login() {
   const data = await act(() => api('/auth/login', 'POST', auth.value), '登录成功')
   if (data) { setToken(data.token); user.value = data.user; await refresh() }
 }
-function logout() { setToken(''); user.value = null; currentAttempt.value = null; result.value = null; catalog.value = null; selectedChapter.value = ''; pages.value = []; knowledge.value = []; questions.value = [] }
+function sourceImageKey(book: number, page: number) { return `${book}:${page}` }
+function sourceImageUrl(book: number, page: number) { return sourceImages.value[sourceImageKey(book, page)] || '' }
+function sourceImageError(book: number, page: number) { return sourceImageErrors.value[sourceImageKey(book, page)] || '' }
+async function loadSourceImage(book: number, page: number) {
+  const key = sourceImageKey(book, page)
+  if (sourceImages.value[key] || pendingSourceImages.has(key)) return
+  pendingSourceImages.add(key)
+  const requestedToken = token
+  try {
+    const blob = await apiBlob(`/books/${book}/pages/${page}/image`)
+    const url = URL.createObjectURL(blob)
+    if (token !== requestedToken) { URL.revokeObjectURL(url); return }
+    sourceImages.value[key] = url
+    delete sourceImageErrors.value[key]
+  } catch (e: any) { sourceImageErrors.value[key] = e.message || '原文页图加载失败' }
+  finally { pendingSourceImages.delete(key) }
+}
+function clearSourceImages() {
+  for (const url of Object.values(sourceImages.value)) URL.revokeObjectURL(url)
+  sourceImages.value = {}; sourceImageErrors.value = {}
+}
+watch([tab, bookId, chapterQuestions, questionSourcePage], () => {
+  if (tab.value !== 'questions' || !bookId.value) return
+  for (const q of chapterQuestions.value) if (q.image_pdf_page) loadSourceImage(bookId.value, q.image_pdf_page)
+  if (questionSourcePage.value) loadSourceImage(bookId.value, questionSourcePage.value)
+})
+watch(currentAttempt, attempt => {
+  if (attempt?.book_id) for (const q of attempt.questions || []) {
+    if (q.image_pdf_page) loadSourceImage(attempt.book_id, q.image_pdf_page)
+  }
+})
+watch(result, value => {
+  if (value?.book_id) for (const row of value.result || []) {
+    if (row.image_pdf_page) loadSourceImage(value.book_id, row.image_pdf_page)
+  }
+})
+watch(practice, value => {
+  if (value?.question?.book_id && value.question.image_pdf_page)
+    loadSourceImage(value.question.book_id, value.question.image_pdf_page)
+})
+function logout() { clearSourceImages(); setToken(''); user.value = null; currentAttempt.value = null; result.value = null; catalog.value = null; selectedChapter.value = ''; pages.value = []; knowledge.value = []; questions.value = [] }
 async function refresh() {
   if (!user.value) return
   const base = await Promise.all([api('/books'), api('/papers')])
@@ -130,7 +179,7 @@ async function refresh() {
     bookId.value = null; pages.value = []; catalog.value = null; tocDraft.value = []; learning.value = null
     selectedChapter.value = ''; selectedPage.value = null; selectedHeadingIndices.value = []
     knowledge.value = []; questions.value = []; knowledgeEdit.value = null; questionEdit.value = null
-    paperForm.value.knowledge_ids = []
+    paperForm.value.question_ids = []
   }
 }
 async function loadBook(id: number) {
@@ -144,7 +193,8 @@ async function loadBook(id: number) {
     tocDraft.value = JSON.parse(JSON.stringify(c.toc || []))
     if (JSON.stringify(previousToc) !== JSON.stringify(c.toc)) selectedHeadingIndices.value = []
     if (changedBook || !chapterNames.value.includes(selectedChapter.value)) { selectedChapter.value = chapterNames.value[0] || ''; selectedHeadingIndices.value = [] }
-    if (changedBook) { chooseKnowledge(); chooseQuestion(); paperForm.value.knowledge_ids = [] }
+    if (changedBook) { chooseKnowledge(); chooseQuestion(); paperForm.value.question_ids = [] }
+    else paperForm.value.question_ids = paperForm.value.question_ids.filter((id: number) => paperCandidateQuestions.value.some(q => q.id === id))
   }
   try { learning.value = await api(`/books/${id}/learning`) } catch { learning.value = null }
   if (!isStaff.value) {
@@ -278,7 +328,6 @@ async function deleteKnowledge(item: any) {
   const result = await act(() => api(`/knowledge/${item.id}`, 'DELETE'), '知识点已删除')
   if (result) {
     if (knowledgeEdit.value === item.id) chooseKnowledge()
-    paperForm.value.knowledge_ids = paperForm.value.knowledge_ids.filter((id: number) => id !== item.id)
     await loadBook(bookId.value!)
     if (questionForm.value.knowledge_id === item.id) chooseQuestion()
   }
@@ -295,7 +344,7 @@ function chooseQuestion(q?: any) {
 function onChapterChange() {
   selectedPage.value = null
   selectedHeadingIndices.value = []
-  paperForm.value.knowledge_ids = []
+  paperForm.value.question_ids = []
   chooseKnowledge()
   chooseQuestion()
 }
@@ -309,7 +358,8 @@ async function reviewQuestion(id: number, approve: boolean) {
   await loadBook(bookId.value!)
 }
 async function makePaper() {
-  const paper = await act(() => api('/papers', 'POST', { ...paperForm.value, book_id: bookId.value, chapter: selectedChapter.value }), '试卷草稿已生成')
+  const paper = await act(() => api('/papers', 'POST', { ...paperForm.value, book_id: bookId.value,
+    chapter: selectedChapter.value, question_count: paperForm.value.question_ids.length }), '试卷草稿已生成')
   if (paper) await refresh()
 }
 async function publishPaper(id: number) {
@@ -419,7 +469,7 @@ onMounted(async () => {
     }).catch(() => {})
   }, 5000)
 })
-onUnmounted(() => { if (interval) clearInterval(interval) })
+onUnmounted(() => { if (interval) clearInterval(interval); clearSourceImages() })
 </script>
 
 <template>
@@ -427,7 +477,7 @@ onUnmounted(() => { if (interval) clearInterval(interval) })
     <header class="topbar"><div class="brand"><span class="brand-mark">A</span><div><strong>Abook</strong><small>教材 · 知识 · 考试</small></div></div><div v-if="user" class="account"><span class="role-tag">{{ user.role === 'admin' ? '管理员' : user.role === 'teacher' ? '教师' : '学生' }}</span><span>{{ user.username }}</span><button class="text-btn" @click="logout">退出</button></div></header>
     <main v-if="!user" class="login-wrap"><section class="login-hero"><p class="eyebrow">LEARNING OPERATIONS</p><h1>从一页教材<br>到一次有效学习。</h1><p>解析、审核、出题、考试与错题练习，都沿着原文出处有序推进。</p><div class="flow-mini"><span>教材 PDF</span><i>→</i><span>知识点</span><i>→</i><span>题库</span><i>→</i><span>考试</span></div></section><section class="login-card"><p class="eyebrow">WELCOME BACK</p><h2>登录工作台</h2><p class="muted">首次使用 admin 登录；教师和学生账号由 admin 创建。</p><label>用户名<input v-model="auth.username" autocomplete="username" /></label><label>密码<input v-model="auth.password" type="password" autocomplete="current-password" @keyup.enter="login" /></label><button class="primary full" :disabled="busy" @click="login">登录</button><p v-if="error" class="alert error">{{ error }}</p></section></main>
     <div v-else class="workspace"><aside class="sidebar"><div class="side-label">工作区</div><button :class="{ active: tab === 'overview' }" @click="tab = 'overview'">◫ <span>总览</span></button><button :class="{ active: tab === 'books' }" @click="tab = 'books'">▤ <span>教材与学习</span></button><template v-if="isStaff"><button :class="{ active: tab === 'knowledge' }" @click="tab = 'knowledge'">◇ <span>知识点审核</span></button><button :class="{ active: tab === 'questions' }" @click="tab = 'questions'">☷ <span>试题审核</span></button><button :class="{ active: tab === 'papers' }" @click="tab = 'papers'">▣ <span>组卷与发布</span></button><button :class="{ active: tab === 'jobs' }" @click="tab = 'jobs'">◴ <span>后台任务</span></button><button :class="{ active: tab === 'models' }" @click="tab = 'models'">✦ <span>模型接入</span></button><button :class="{ active: tab === 'users' }" @click="tab = 'users'">♙ <span>账号管理</span></button></template><template v-if="canExam"><button :class="{ active: tab === 'exam' }" @click="tab = 'exam'">✎ <span>参加考试</span></button><button :class="{ active: tab === 'results' }" @click="tab = 'results'">◈ <span>成绩与错题</span></button></template><div class="side-footer">PDF · 单选题 · 人工审核<br>第一版闭环</div></aside>
-      <div class="content"><div v-if="error" class="alert error"><span>{{ error }}</span><button @click="error = ''">×</button></div><div v-if="notice" class="alert success">{{ notice }}</div>
+      <div class="content" :class="{ 'question-content': tab === 'questions' }"><div v-if="error" class="alert error"><span>{{ error }}</span><button @click="error = ''">×</button></div><div v-if="notice" class="alert success">{{ notice }}</div>
         <section v-if="tab === 'overview'"><div class="page-head"><div><p class="eyebrow">WORKSPACE</p><h1>工作总览</h1><p>按教材原文、审核记录和试卷快照，追踪每一步。</p></div><button class="secondary" @click="refresh">刷新数据</button></div><div class="stat-grid"><div class="stat"><span>教材库</span><strong>{{ books.length }}</strong><small>原 PDF 留存</small></div><div class="stat"><span>{{ isStaff ? '待审核知识点' : '已参加考试' }}</span><strong>{{ isStaff ? knowledge.filter(k => k.status !== 'approved').length : attempts.length }}</strong><small>{{ isStaff ? '需要人工判断' : '每场考试限一次交卷' }}</small></div><div class="stat"><span>{{ isStaff ? '待审核试题' : '知识点掌握' }}</span><strong>{{ isStaff ? questions.filter(q => q.status !== 'approved').length : Object.keys(mastery).length }}</strong><small>{{ isStaff ? '校验后方可发布' : '依据答卷记录' }}</small></div><div class="stat"><span>已发布试卷</span><strong>{{ papers.filter(p => p.status === 'published').length }}</strong><small>答案与规则固定</small></div></div><div class="panel"><h2>闭环进度</h2><div class="steps"><div v-for="(step, i) in ['上传 PDF', '校对索引', '知识点审核', '试题审核', '组卷发布', '判分重练']" :key="step"><b>{{ String(i + 1).padStart(2, '0') }}</b><span>{{ step }}</span></div></div></div><div v-if="isStaff" class="panel"><div class="panel-head"><h2>模型接入</h2><button class="small" @click="tab = 'models'">管理提供商</button></div><div class="source-line"><span>文本：{{ aiStatus?.text?.provider || '未设置' }} / {{ aiStatus?.text?.model || '未设置' }}</span><span>视觉 OCR：{{ aiStatus?.vision?.provider || '未设置' }} / {{ aiStatus?.vision?.model || '未设置' }}</span></div></div><div v-if="isStaff && jobs.some(j => j.status === 'failed')" class="panel warning"><h3>需要处理的任务</h3><p>有任务失败。打开“后台任务”查看错误，并重试或人工修正。</p></div></section>
 
         <section v-if="tab === 'books'">
@@ -463,13 +513,14 @@ onUnmounted(() => { if (interval) clearInterval(interval) })
           </div>
         </section>
 
-        <section v-if="tab === 'questions' && isStaff">
+        <section v-if="tab === 'questions' && isStaff" class="question-workspace">
           <div class="page-head"><div><p class="eyebrow">CHAPTER QUESTIONS</p><h1>按教材目录出题与审核</h1><p>先选择教材和章节，再勾选出题范围；题目依据来自该范围内已审核知识点。</p></div><div class="button-row"><input v-model.number="chapterQuestionCount" type="number" min="1" max="30" aria-label="生成题数" class="count-input" /><button class="primary" :disabled="busy || !selectedBook?.mapping_confirmed || !approvedChapterKnowledge.length || !headingSelectionReady" @click="generateChapterQuestions">按所选标题出题</button></div></div>
           <div class="selector-row"><span>① 教材</span><select :value="bookId || ''" @change="loadBook(Number(($event.target as HTMLSelectElement).value))"><option v-for="b in books" :key="b.id" :value="b.id">{{ b.title }} · {{ b.page_count }} 页</option></select><span>② 章节</span><select v-model="selectedChapter" @change="onChapterChange"><option v-for="chapter in chapterNames" :key="chapter" :value="chapter">{{ chapter }}</option></select><span>{{ chapterQuestions.length }} 道题 · {{ approvedChapterKnowledge.length }} 条已审核知识点</span></div>
           <div v-if="chapterOutline.length" class="panel"><div class="panel-head"><h2>③ 选择目录标题</h2><span>勾选大标题将自动包含下方所有小标题</span></div><div class="heading-tree"><label v-for="heading in chapterOutline" :key="heading.index" :style="{ paddingLeft: `${12 + (heading.level - chapterOutline[0].level) * 22}px` }"><input type="checkbox" :disabled="chapterOutline.length === 1" :checked="selectedHeadingIndices.includes(heading.index) || (chapterOutline.length === 1 && heading.index === chapterOutline[0].index)" @change="toggleHeading(heading.index, ($event.target as HTMLInputElement).checked)" /><strong>{{ heading.title }}</strong><small>PDF {{ heading.pdf_page }}</small></label></div><p v-if="chapterOutline.length > 1 && !selectedHeadingIndices.length" class="muted">请选择至少一个标题。选择章标题会包含整章。</p></div>
-          <div class="two-col"><div class="panel"><div class="panel-head"><h2>本章试题</h2><span>{{ chapterQuestions.length }} 道</span></div>
+          <div class="two-col question-columns"><div class="panel"><div class="panel-head"><h2>本章试题</h2><span>{{ chapterQuestions.length }} 道</span></div>
             <div v-for="q in chapterQuestions" :key="q.id" class="record">
               <div class="record-top"><strong>#{{ q.id }} · {{ q.stem }}</strong><span class="badge" :class="q.status">{{ statusName(q.status) }}</span></div>
+              <div v-if="q.image_pdf_page && bookId" class="figure-preview"><span>教材 PDF 第 {{ q.image_pdf_page }} 页原图 · 点击放大</span><a v-if="sourceImageUrl(bookId, q.image_pdf_page)" :href="sourceImageUrl(bookId, q.image_pdf_page)" target="_blank" rel="noopener"><img :src="sourceImageUrl(bookId, q.image_pdf_page)" :alt="`试题 #${q.id} 的教材原文页图`" /></a><p v-else class="muted">{{ sourceImageError(bookId, q.image_pdf_page) || '原文页图加载中…' }}</p></div>
               <div class="option-preview"><span v-for="key in ['A','B','C','D']" :key="key" :class="{ correct: q.answer === key }">{{ key }}. {{ q.options[key] }}</span></div>
               <p class="muted">解析：{{ q.explanation }}</p><blockquote>{{ q.evidence }}</blockquote>
               <div v-for="problem in q.validation" :key="problem" :class="q.status === 'approved' ? 'reviewed-issue' : 'issue'">{{ q.status === 'approved' ? `人工已确认：${problem}` : problem }}</div>
@@ -480,6 +531,7 @@ onUnmounted(() => { if (interval) clearInterval(interval) })
               <h2>{{ questionEdit ? `编辑试题 #${questionEdit}` : '录入本章单选题' }}</h2>
               <label>本章知识点<select v-model.number="questionForm.knowledge_id"><option v-for="k in approvedChapterKnowledge" :key="k.id" :value="k.id">#{{ k.id }} {{ k.title }}</option></select></label>
               <div v-if="questionSource" class="source-preview"><span>该知识点的教材原文摘录</span><blockquote>{{ questionSource }}</blockquote><button class="small" @click="questionForm.evidence = questionSource">填入原文依据</button><p class="muted">填入后仍需核对题干、答案与解析是否由这段原文支持。</p></div>
+              <div v-if="questionSourcePage && bookId" class="figure-preview"><span>出处 PDF 第 {{ questionSourcePage }} 页原图 · 点击放大</span><a v-if="sourceImageUrl(bookId, questionSourcePage)" :href="sourceImageUrl(bookId, questionSourcePage)" target="_blank" rel="noopener"><img :src="sourceImageUrl(bookId, questionSourcePage)" alt="当前知识点的教材原文页图" /></a><p v-else class="muted">{{ sourceImageError(bookId, questionSourcePage) || '原文页图加载中…' }}</p><p class="muted">题干引用图号时，原页图也会提供给考生；审核时请检查页图是否直接包含答案。</p></div>
               <label>题干<textarea v-model="questionForm.stem" rows="3"></textarea></label>
               <label v-for="key in ['A','B','C','D']" :key="key">选项 {{ key }}<input v-model="questionForm.options[key]" /></label>
               <div class="form-row"><label>正确答案<select v-model="questionForm.answer"><option v-for="key in ['A','B','C','D']" :key="key">{{ key }}</option></select></label><label>难度<select v-model="questionForm.difficulty"><option value="easy">简单</option><option value="medium">中等</option><option value="hard">困难</option></select></label></div>
@@ -491,13 +543,13 @@ onUnmounted(() => { if (interval) clearInterval(interval) })
 
         <section v-if="tab === 'papers' && isStaff">
           <div class="page-head"><div><p class="eyebrow">EXAM RELEASE</p><h1>组卷与发布</h1><p>发布时冻结题目、答案、解析和分值，历史答卷按快照判分。</p></div></div>
-          <div v-if="isOperator" class="panel form-panel"><h2>新建本章试卷草稿</h2><label>章节<select v-model="selectedChapter" @change="onChapterChange"><option v-for="chapter in chapterNames" :key="chapter" :value="chapter">{{ chapter }}</option></select></label><div class="form-row"><label>试卷名称<input v-model="paperForm.title" placeholder="如：第一章测验" /></label><label>题目数量<input v-model.number="paperForm.question_count" type="number" min="1" /></label><label>每题分值<input v-model.number="paperForm.score_each" type="number" min="1" /></label><label>难度<select v-model="paperForm.difficulty"><option value="any">不限</option><option value="easy">简单</option><option value="medium">中等</option><option value="hard">困难</option></select></label></div><div class="check-grid"><label v-for="k in approvedChapterKnowledge" :key="k.id"><input v-model="paperForm.knowledge_ids" type="checkbox" :value="k.id" /> {{ k.title }}</label></div><p class="muted">预估总分：{{ paperForm.question_count * paperForm.score_each }} 分。仅从当前章节的已审核题目组卷，系统优先覆盖不同知识点。</p><button class="primary" :disabled="busy" @click="makePaper">生成试卷草稿</button></div>
+          <div v-if="isOperator" class="panel form-panel"><h2>新建本章试卷草稿</h2><label>章节<select v-model="selectedChapter" @change="onChapterChange"><option v-for="chapter in chapterNames" :key="chapter" :value="chapter">{{ chapter }}</option></select></label><div class="form-row"><label>试卷名称<input v-model="paperForm.title" placeholder="如：第一章测验" /></label><label>每题分值<input v-model.number="paperForm.score_each" type="number" min="1" /></label><label>难度筛选<select v-model="paperForm.difficulty" @change="paperForm.question_ids = []"><option value="any">不限</option><option value="easy">简单</option><option value="medium">中等</option><option value="hard">困难</option></select></label></div><div class="panel-head"><h3>选择已审核考题</h3><span>{{ paperForm.question_ids.length }} / {{ paperCandidateQuestions.length }} 道已选</span></div><div class="paper-question-list"><label v-for="q in paperCandidateQuestions" :key="q.id" class="paper-question-option"><input v-model="paperForm.question_ids" type="checkbox" :value="q.id" /><span><strong>#{{ q.id }} · {{ q.stem }}</strong><small>{{ Object.entries(q.options).map(([key, value]) => `${key}. ${value}`).join(' · ') }}</small><small>{{ { easy: '简单', medium: '中等', hard: '困难' }[q.difficulty as 'easy' | 'medium' | 'hard'] || q.difficulty }} · {{ knowledge.find(k => k.id === q.knowledge_id)?.title }}</small></span></label><p v-if="!paperCandidateQuestions.length" class="empty">本章没有符合难度的已审核考题，请先到“试题审核”完成审核。</p></div><p class="muted">已选 {{ paperForm.question_ids.length }} 题，预估总分 {{ paperForm.question_ids.length * paperForm.score_each }} 分。试卷将使用勾选的考题。</p><button class="primary" :disabled="busy || !paperForm.title.trim() || !paperForm.question_ids.length || paperForm.question_ids.length > 100" @click="makePaper">生成试卷草稿</button></div>
           <div class="panel"><div class="panel-head"><h2>试卷列表</h2><span>{{ visiblePapers.length }} 份</span></div>
             <div v-for="paper in visiblePapers" :key="paper.id" class="record">
               <div class="record-top"><strong>{{ paper.title }}</strong><span class="badge" :class="paper.status === 'published' && paperEnded(paper) ? 'done' : paper.status">{{ paperLabel(paper) }}</span></div>
               <div class="source-line"><span>教材：{{ books.find(b => b.id === paper.book_id)?.title || '已从教材库移除' }}</span><span>{{ paper.total_score }} 分</span><span>{{ paper.rule?.question_ids?.length || paper.snapshot?.length }} 题</span><span v-if="paper.rule">覆盖率 {{ Math.round(paper.rule.coverage * 100) }}%</span></div>
               <p v-if="paper.starts_at && paper.ends_at" class="muted">{{ time(paper.starts_at) }} 至 {{ time(paper.ends_at) }}</p>
-              <details class="paper-preview"><summary>预览试卷与评分规则</summary><div v-for="(q, i) in paperPreview(paper)" :key="q.id"><strong>{{ i + 1 }}. {{ q.stem }}（{{ q.score }} 分）</strong><p>{{ Object.entries(q.options).map(([key, value]) => `${key}. ${value}`).join(' · ') }}</p><small>答案 {{ q.answer }} · {{ q.explanation }}</small></div></details>
+              <details class="paper-preview"><summary>预览试卷与评分规则</summary><div v-for="(q, i) in paperPreview(paper)" :key="q.id"><strong>{{ i + 1 }}. {{ q.stem }}（{{ q.score }} 分）</strong><div v-if="q.image_pdf_page" class="figure-preview"><button v-if="!sourceImageUrl(paper.book_id, q.image_pdf_page)" class="small" @click="loadSourceImage(paper.book_id, q.image_pdf_page)">查看教材页图</button><a v-else :href="sourceImageUrl(paper.book_id, q.image_pdf_page)" target="_blank" rel="noopener"><img :src="sourceImageUrl(paper.book_id, q.image_pdf_page)" :alt="`试题 #${q.id} 的教材原文页图`" /></a></div><p>{{ Object.entries(q.options).map(([key, value]) => `${key}. ${value}`).join(' · ') }}</p><small>答案 {{ q.answer }} · {{ q.explanation }}</small></div></details>
               <div v-if="paper.status === 'draft'" class="publish-row"><label>开始<input v-model="publishStart" type="datetime-local" /></label><label>结束<input v-model="publishEnd" type="datetime-local" /></label><button class="primary" :disabled="busy" @click="publishPaper(paper.id)">核对并发布</button></div>
               <div v-if="paper.status === 'published' && paperTimeEdit === paper.id" class="publish-row"><label>开始<input v-model="paperTimeForm.starts_at" type="datetime-local" /></label><label>结束<input v-model="paperTimeForm.ends_at" type="datetime-local" /></label><button class="primary" :disabled="busy" @click="savePaperTime(paper.id)">保存时间</button><button class="secondary" @click="paperTimeEdit = null">取消</button></div>
               <div v-if="paper.status === 'published' || paper.status === 'terminated'" class="button-row"><button v-if="paper.status === 'published' && paperTimeEdit !== paper.id" class="secondary" @click="editPaperTime(paper)">修改时间</button><button v-if="paper.status === 'published' && !paperEnded(paper)" class="danger-btn" :disabled="busy" @click="terminatePaper(paper)">终止考试</button><button v-if="paperCanDelete(paper)" class="danger-btn" :disabled="busy" @click="deletePaper(paper)">删除试卷</button></div>
@@ -532,9 +584,9 @@ onUnmounted(() => { if (interval) clearInterval(interval) })
 
         <section v-if="tab === 'jobs' && isStaff"><div class="page-head"><div><p class="eyebrow">TASK MONITOR</p><h1>后台任务</h1><p>解析、知识点提取和出题均由队列处理。已结束任务可从列表清空，历史记录留存。</p></div><div class="action-strip"><button class="secondary" :disabled="busy" @click="refresh">刷新</button><button class="secondary" :disabled="busy" @click="clearFinishedJobs">清空已结束任务</button></div></div><div class="panel"><div v-for="job in jobs" :key="job.id" class="job-row"><div><strong>#{{ job.id }} · {{ job.kind === 'toc' ? '目录解析' : job.kind === 'parse' ? '章节正文解析' : job.kind === 'knowledge' ? '本章知识点总结' : job.kind === 'chapter_questions' ? '本章出题' : 'AI 出题' }}</strong><p>{{ job.error || `目标 #${job.target_id}` }}</p></div><div class="job-progress"><div class="progress-track"><i :style="{ width: `${job.total ? job.progress / job.total * 100 : 0}%` }"></i></div><small>{{ job.progress }} / {{ job.total }}</small></div><span class="badge" :class="job.status">{{ statusName(job.status) }}</span><button v-if="['queued','running','retrying'].includes(job.status)" class="small" @click="cancelJob(job.id)">取消</button><button v-if="['failed','cancelled'].includes(job.status)" class="small" @click="retryJob(job.id)">重试</button></div><div v-if="!jobs.length" class="empty">暂无任务。</div></div></section>
 
-        <section v-if="tab === 'exam' && canExam"><div class="page-head"><div><p class="eyebrow">TAKE AN EXAM</p><h1>参加考试</h1><p>服务端计时与自动保存；每场考试只能交卷一次。</p></div><strong v-if="currentAttempt" class="countdown">剩余 {{ remaining }}</strong></div><div v-if="currentAttempt" class="panel exam-panel"><div v-for="(q, index) in currentAttempt.questions" :key="q.id" class="exam-question"><h3>{{ index + 1 }}. {{ q.stem }} <small>{{ q.score }} 分</small></h3><label v-for="key in ['A','B','C','D']" :key="key" class="exam-option"><input type="radio" :name="`q-${q.id}`" :checked="currentAttempt.answers[q.id] === key" @change="saveAnswer(q.id, key)" /><span>{{ key }}. {{ q.options[key] }}</span></label></div><button class="primary" @click="submitExam">提交试卷</button></div><div v-else class="card-grid"><div v-for="paper in papers" :key="paper.id" class="panel exam-card"><span class="badge published">已发布</span><h2>{{ paper.title }}</h2><p>总分 {{ paper.total_score }} 分</p><p class="muted">{{ time(paper.starts_at) }} — {{ time(paper.ends_at) }}</p><button class="primary" @click="startExam(paper.id)">进入考试</button></div><div v-if="!papers.length" class="panel empty">暂无已发布考试。</div></div></section>
+        <section v-if="tab === 'exam' && canExam"><div class="page-head"><div><p class="eyebrow">TAKE AN EXAM</p><h1>参加考试</h1><p>服务端计时与自动保存；每场考试只能交卷一次。</p></div><strong v-if="currentAttempt" class="countdown">剩余 {{ remaining }}</strong></div><div v-if="currentAttempt" class="panel exam-panel"><div v-for="(q, index) in currentAttempt.questions" :key="q.id" class="exam-question"><h3>{{ index + 1 }}. {{ q.stem }} <small>{{ q.score }} 分</small></h3><div v-if="q.image_pdf_page && currentAttempt.book_id" class="figure-preview"><span>教材原文页图</span><a v-if="sourceImageUrl(currentAttempt.book_id, q.image_pdf_page)" :href="sourceImageUrl(currentAttempt.book_id, q.image_pdf_page)" target="_blank" rel="noopener"><img :src="sourceImageUrl(currentAttempt.book_id, q.image_pdf_page)" :alt="`第 ${index + 1} 题的教材图片`" /></a><p v-else class="muted">{{ sourceImageError(currentAttempt.book_id, q.image_pdf_page) || '图片加载中…' }}</p></div><label v-for="key in ['A','B','C','D']" :key="key" class="exam-option"><input type="radio" :name="`q-${q.id}`" :checked="currentAttempt.answers[q.id] === key" @change="saveAnswer(q.id, key)" /><span>{{ key }}. {{ q.options[key] }}</span></label></div><button class="primary" @click="submitExam">提交试卷</button></div><div v-else class="card-grid"><div v-for="paper in papers" :key="paper.id" class="panel exam-card"><span class="badge published">已发布</span><h2>{{ paper.title }}</h2><p>总分 {{ paper.total_score }} 分</p><p class="muted">{{ time(paper.starts_at) }} — {{ time(paper.ends_at) }}</p><button class="primary" @click="startExam(paper.id)">进入考试</button></div><div v-if="!papers.length" class="panel empty">暂无已发布考试。</div></div></section>
 
-        <section v-if="tab === 'results' && canExam"><div class="page-head"><div><p class="eyebrow">REVIEW & PRACTICE</p><h1>成绩与错题</h1><p>回到原文，优先用已审核原题重练；变式题审核通过后开放。</p></div></div><div class="two-col"><div class="panel"><h2>我的答卷</h2><button v-for="a in attempts" :key="a.id" class="attempt-row" @click="openResult(a.id)"><span><strong>{{ a.paper_title }}</strong><small>{{ time(a.submitted_at || a.started_at) }}</small></span><b>{{ a.score === null ? '进行中' : `${a.score} 分` }}</b></button><div v-if="!attempts.length" class="empty">还没有答卷。</div></div><div class="panel"><h2>知识点掌握</h2><div v-for="(m, id) in mastery" :key="id" class="mastery-row"><span>{{ m.title || `知识点 #${id}` }}</span><strong>{{ m.correct }} / {{ m.total }}</strong></div><div v-if="!Object.keys(mastery).length" class="empty">交卷后显示掌握情况。</div></div></div><div v-if="variantRequests.length" class="panel"><h2>变式题请求</h2><div v-for="request in variantRequests" :key="request.original_id" class="mastery-row"><span>原题 #{{ request.original_id }} · {{ request.error || (request.question_status === 'approved' ? '可在错题处开始练习' : request.question_status ? '等待审核员确认' : '正在生成') }}</span><strong>{{ statusName(request.question_status || request.job_status) }}</strong></div></div><div v-if="result?.submitted_at" class="panel"><div class="panel-head"><h2>本次成绩：{{ result.score }} 分</h2><span>{{ wrongRows.length }} 道错题</span></div><div v-for="row in wrongRows" :key="row.question_id" class="record"><strong>{{ row.stem }}</strong><p>你的答案：{{ row.answer || '未作答' }} · 正确答案：{{ row.correct_answer }}</p><p>{{ row.explanation }}</p><blockquote>{{ row.evidence }}</blockquote><div class="button-row"><button class="secondary" @click="startPractice(row, 'original')">原题重练</button><button class="secondary" @click="startPractice(row, 'variant')">同知识点变式</button></div></div><div v-if="!wrongRows.length" class="empty">本次没有错题。</div></div><div v-if="practice" class="panel practice-panel"><h2>{{ practice.practice.mode === 'variant' ? '变式练习' : '原题重练' }}</h2><h3>{{ practice.question.stem }}</h3><label v-for="key in ['A','B','C','D']" :key="key" class="exam-option"><input v-model="practice.selected" type="radio" :value="key" :disabled="!!practice.feedback" /><span>{{ key }}. {{ practice.question.options[key] }}</span></label><button v-if="!practice.feedback" class="primary" @click="answerPractice">提交练习</button><div v-else class="feedback"><strong>{{ practice.feedback.correct ? '回答正确' : `正确答案：${practice.feedback.answer}` }}</strong><p>{{ practice.feedback.explanation }}</p><blockquote>{{ practice.feedback.evidence }}</blockquote></div></div></section>
+        <section v-if="tab === 'results' && canExam"><div class="page-head"><div><p class="eyebrow">REVIEW & PRACTICE</p><h1>成绩与错题</h1><p>回到原文，优先用已审核原题重练；变式题审核通过后开放。</p></div></div><div class="two-col"><div class="panel"><h2>我的答卷</h2><button v-for="a in attempts" :key="a.id" class="attempt-row" @click="openResult(a.id)"><span><strong>{{ a.paper_title }}</strong><small>{{ time(a.submitted_at || a.started_at) }}</small></span><b>{{ a.score === null ? '进行中' : `${a.score} 分` }}</b></button><div v-if="!attempts.length" class="empty">还没有答卷。</div></div><div class="panel"><h2>知识点掌握</h2><div v-for="(m, id) in mastery" :key="id" class="mastery-row"><span>{{ m.title || `知识点 #${id}` }}</span><strong>{{ m.correct }} / {{ m.total }}</strong></div><div v-if="!Object.keys(mastery).length" class="empty">交卷后显示掌握情况。</div></div></div><div v-if="variantRequests.length" class="panel"><h2>变式题请求</h2><div v-for="request in variantRequests" :key="request.original_id" class="mastery-row"><span>原题 #{{ request.original_id }} · {{ request.error || (request.question_status === 'approved' ? '可在错题处开始练习' : request.question_status ? '等待审核员确认' : '正在生成') }}</span><strong>{{ statusName(request.question_status || request.job_status) }}</strong></div></div><div v-if="result?.submitted_at" class="panel"><div class="panel-head"><h2>本次成绩：{{ result.score }} 分</h2><span>{{ wrongRows.length }} 道错题</span></div><div v-for="row in wrongRows" :key="row.question_id" class="record"><strong>{{ row.stem }}</strong><div v-if="row.image_pdf_page && result.book_id" class="figure-preview"><span>教材原文页图</span><a v-if="sourceImageUrl(result.book_id, row.image_pdf_page)" :href="sourceImageUrl(result.book_id, row.image_pdf_page)" target="_blank" rel="noopener"><img :src="sourceImageUrl(result.book_id, row.image_pdf_page)" alt="错题对应的教材原文页图" /></a><p v-else class="muted">{{ sourceImageError(result.book_id, row.image_pdf_page) || "图片加载中…" }}</p></div><p>你的答案：{{ row.answer || '未作答' }} · 正确答案：{{ row.correct_answer }}</p><p>{{ row.explanation }}</p><blockquote>{{ row.evidence }}</blockquote><div class="button-row"><button class="secondary" @click="startPractice(row, 'original')">原题重练</button><button class="secondary" @click="startPractice(row, 'variant')">同知识点变式</button></div></div><div v-if="!wrongRows.length" class="empty">本次没有错题。</div></div><div v-if="practice" class="panel practice-panel"><h2>{{ practice.practice.mode === 'variant' ? '变式练习' : '原题重练' }}</h2><h3>{{ practice.question.stem }}</h3><div v-if="practice.question.image_pdf_page && practice.question.book_id" class="figure-preview"><span>教材原文页图</span><a v-if="sourceImageUrl(practice.question.book_id, practice.question.image_pdf_page)" :href="sourceImageUrl(practice.question.book_id, practice.question.image_pdf_page)" target="_blank" rel="noopener"><img :src="sourceImageUrl(practice.question.book_id, practice.question.image_pdf_page)" alt="练习题对应的教材原文页图" /></a><p v-else class="muted">{{ sourceImageError(practice.question.book_id, practice.question.image_pdf_page) || "图片加载中…" }}</p></div><label v-for="key in ['A','B','C','D']" :key="key" class="exam-option"><input v-model="practice.selected" type="radio" :value="key" :disabled="!!practice.feedback" /><span>{{ key }}. {{ practice.question.options[key] }}</span></label><button v-if="!practice.feedback" class="primary" @click="answerPractice">提交练习</button><div v-else class="feedback"><strong>{{ practice.feedback.correct ? '回答正确' : `正确答案：${practice.feedback.answer}` }}</strong><p>{{ practice.feedback.explanation }}</p><blockquote>{{ practice.feedback.evidence }}</blockquote></div></div></section>
       </div>
     </div>
   </div>

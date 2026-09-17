@@ -14,3 +14,13 @@ export async function api(path: string, method = 'GET', body?: unknown): Promise
   if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail || data))
   return data
 }
+
+export async function apiBlob(path: string): Promise<Blob> {
+  const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {}
+  const response = await fetch(`/api${path}`, { headers })
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}))
+    throw new Error(typeof data.detail === 'string' ? data.detail : '图片加载失败')
+  }
+  return response.blob()
+}

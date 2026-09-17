@@ -11,6 +11,7 @@ import pymupdf
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -22,7 +23,7 @@ from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_
 from .db import Base, SessionLocal, engine, get_db, now
 from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, JobDismissal, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
 from .security import bootstrap, check_password, current_user, hash_password, issue_token, roles
-from .services import audit, blocking_question_errors, page_issues, question_public, question_snapshot, rebuild_chunks, scoped_knowledge, validate_question
+from .services import audit, blocking_question_errors, page_issues, question_image_page, question_public, question_snapshot, rebuild_chunks, scoped_knowledge, validate_question
 from .tasks import run_job
 
 
@@ -399,6 +400,26 @@ def pages(book_id: int, user: User = Depends(roles("admin")), db: Session = Depe
     return out(db.scalars(select(Page).where(Page.book_id == book_id).order_by(Page.pdf_page)).all())
 
 
+@app.get("/api/books/{book_id}/pages/{pdf_page}/image")
+def page_image(book_id: int, pdf_page: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    book = require(db.get(Book, book_id))
+    if user.role != "admin" and not (book.status != "deleted" and book.mapping_confirmed):
+        attempted = db.scalar(select(Attempt.id).join(Paper, Attempt.paper_id == Paper.id).where(
+            Attempt.user_id == user.id, Paper.book_id == book_id))
+        if not attempted:
+            raise HTTPException(403, "无权查看教材页图")
+    if pdf_page < 1 or pdf_page > book.page_count:
+        raise HTTPException(404, "PDF 页面不存在")
+    try:
+        with pymupdf.open(book.file_path) as pdf:
+            page = pdf[pdf_page - 1]
+            scale = min(1.7, 1800 / max(page.rect.width, page.rect.height))
+            png = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).tobytes("png")
+    except (FileNotFoundError, pymupdf.FileDataError, IndexError) as exc:
+        raise HTTPException(404, "PDF 原页不可用") from exc
+    return Response(png, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+
 class PageEdit(BaseModel):
     printed_page: str
     chapter: str
@@ -752,7 +773,8 @@ class QuestionInput(BaseModel):
 def questions(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     active_book(db, book_id)
     ids = select(Knowledge.id).where(Knowledge.book_id == book_id, Knowledge.status != "deleted")
-    return out(db.scalars(select(Question).where(Question.knowledge_id.in_(ids)).order_by(Question.id.desc())).all())
+    items = db.scalars(select(Question).where(Question.knowledge_id.in_(ids)).order_by(Question.id.desc())).all()
+    return [{**out(q), "image_pdf_page": question_image_page(db, q.stem, q.chunk_id)} for q in items]
 
 
 @app.post("/api/questions")
@@ -830,7 +852,8 @@ class PaperInput(BaseModel):
     book_id: int
     title: str
     chapter: str = ""
-    knowledge_ids: list[int]
+    knowledge_ids: list[int] = Field(default_factory=list)
+    question_ids: list[int] = Field(default_factory=list)
     question_count: int = Field(ge=1, le=100)
     score_each: int = Field(ge=1, le=100)
     difficulty: str = "any"
@@ -847,25 +870,40 @@ def create_paper(data: PaperInput, user: User = Depends(roles("admin")), db: Ses
     if data.chapter:
         allowed_query = allowed_query.where(Knowledge.chapter == data.chapter)
     allowed_ids = set(db.scalars(allowed_query).all())
-    if not data.knowledge_ids or not set(data.knowledge_ids).issubset(allowed_ids):
-        raise HTTPException(400, "请选择本教材已审核知识点")
-    pool = db.scalars(select(Question).where(Question.knowledge_id.in_(data.knowledge_ids), Question.status == "approved").order_by(Question.id)).all()
-    if data.difficulty != "any":
-        pool = [q for q in pool if q.difficulty == data.difficulty]
-    selected = []
-    # Select across knowledge points before taking a second question from one point.
-    while len(selected) < data.question_count:
-        progressed = False
-        for knowledge_id in data.knowledge_ids:
-            candidate = next((q for q in pool if q.knowledge_id == knowledge_id and q.id not in {x.id for x in selected}), None)
-            if candidate:
-                selected.append(candidate)
-                progressed = True
-                if len(selected) == data.question_count:
-                    break
-        if not progressed:
-            raise HTTPException(400, "已审核题目数量不足")
-    rule = {**data.model_dump(), "question_ids": [q.id for q in selected], "coverage": len({q.knowledge_id for q in selected}) / len(set(data.knowledge_ids))}
+    if data.question_ids:
+        if len(data.question_ids) != data.question_count or len(set(data.question_ids)) != len(data.question_ids):
+            raise HTTPException(400, "题目数量须与所选考题一致，且不能重复")
+        available = {q.id: q for q in db.scalars(select(Question).where(Question.id.in_(data.question_ids))).all()}
+        selected = [available.get(qid) for qid in data.question_ids]
+        if any(q is None or q.status != "approved" or q.knowledge_id not in allowed_ids or
+               (data.difficulty != "any" and q.difficulty != data.difficulty) for q in selected):
+            raise HTTPException(400, "只能选择当前教材、章节和难度范围内已审核的考题")
+        coverage = len({q.knowledge_id for q in selected}) / len(allowed_ids) if allowed_ids else 0
+        knowledge_ids = list(dict.fromkeys(q.knowledge_id for q in selected))
+    else:
+        # Keep the original knowledge-point rule for existing API clients.
+        if not data.knowledge_ids or not set(data.knowledge_ids).issubset(allowed_ids):
+            raise HTTPException(400, "请选择本教材已审核知识点或考题")
+        pool = db.scalars(select(Question).where(Question.knowledge_id.in_(data.knowledge_ids), Question.status == "approved").order_by(Question.id)).all()
+        if data.difficulty != "any":
+            pool = [q for q in pool if q.difficulty == data.difficulty]
+        selected = []
+        # Select across knowledge points before taking a second question from one point.
+        while len(selected) < data.question_count:
+            progressed = False
+            for knowledge_id in data.knowledge_ids:
+                candidate = next((q for q in pool if q.knowledge_id == knowledge_id and q.id not in {x.id for x in selected}), None)
+                if candidate:
+                    selected.append(candidate)
+                    progressed = True
+                    if len(selected) == data.question_count:
+                        break
+            if not progressed:
+                raise HTTPException(400, "已审核题目数量不足")
+        coverage = len({q.knowledge_id for q in selected}) / len(set(data.knowledge_ids))
+        knowledge_ids = data.knowledge_ids
+    rule = {**data.model_dump(), "knowledge_ids": knowledge_ids,
+            "question_ids": [q.id for q in selected], "coverage": coverage}
     paper = Paper(book_id=data.book_id, title=data.title, rule=rule,
                   total_score=data.question_count * data.score_each)
     db.add(paper)
@@ -923,7 +961,8 @@ def publish(paper_id: int, data: PublishInput, user: User = Depends(roles("admin
     for question in questions:
         if question.status != "approved" or blocking_question_errors(validate_question(db, question)):
             raise HTTPException(400, f"试题 {question.id} 已变化或未通过审核")
-    snapshot = [question_snapshot(q, paper.rule["score_each"]) for q in questions]
+    snapshot = [question_snapshot(q, paper.rule["score_each"], question_image_page(db, q.stem, q.chunk_id))
+                for q in questions]
     if sum(q["score"] for q in snapshot) != paper.total_score:
         raise HTTPException(400, "总分与评分规则不一致")
     paper.snapshot, paper.starts_at, paper.ends_at = snapshot, start, end
@@ -999,7 +1038,9 @@ def grade(db: Session, attempt: Attempt, paper: Paper, commit: bool = True):
         result.append({"question_id": item["id"], "knowledge_id": item["knowledge_id"],
                        "answer": answer, "correct": correct, "score": item["score"] if correct else 0,
                        "correct_answer": item["answer"], "explanation": item["explanation"],
-                       "evidence": item["evidence"], "stem": item["stem"], "options": item["options"]})
+                       "evidence": item["evidence"], "stem": item["stem"], "options": item["options"],
+                       "image_pdf_page": item.get("image_pdf_page") or
+                       question_image_page(db, item["stem"], item.get("chunk_id"))})
     attempt.result, attempt.score, attempt.submitted_at = result, sum(r["score"] for r in result), now()
     if commit:
         db.commit()
@@ -1014,7 +1055,7 @@ def start_exam(paper_id: int, user: User = Depends(roles("student", "admin")), d
     if attempt:
         if not attempt.submitted_at and now() >= paper.ends_at:
             grade(db, attempt, paper)
-        return attempt_view(attempt, paper)
+        return attempt_view(attempt, paper, db)
     if not (paper.starts_at <= now() < paper.ends_at):
         raise HTTPException(400, "当前不在考试时间内")
     attempt = Attempt(paper_id=paper_id, user_id=user.id, answers={})
@@ -1024,18 +1065,21 @@ def start_exam(paper_id: int, user: User = Depends(roles("student", "admin")), d
     except IntegrityError:
         db.rollback()
         attempt = db.scalar(select(Attempt).where(Attempt.paper_id == paper_id, Attempt.user_id == user.id))
-    return attempt_view(attempt, paper)
+    return attempt_view(attempt, paper, db)
 
 
-def attempt_view(attempt: Attempt, paper: Paper):
+def attempt_view(attempt: Attempt, paper: Paper, db: Session):
     if attempt.submitted_at:
         return {"id": attempt.id, "submitted": True, "score": attempt.score}
     return {"id": attempt.id, "submitted": False, "ends_at": paper.ends_at,
-            "answers": attempt.answers, "questions": [question_public_from_snapshot(q) for q in paper.snapshot]}
+            "book_id": paper.book_id, "answers": attempt.answers,
+            "questions": [question_public_from_snapshot(q, db) for q in paper.snapshot]}
 
 
-def question_public_from_snapshot(q):
-    return {key: q[key] for key in ("id", "stem", "options", "score", "knowledge_id")}
+def question_public_from_snapshot(q, db: Session):
+    value = {key: q[key] for key in ("id", "stem", "options", "score", "knowledge_id")}
+    value["image_pdf_page"] = q.get("image_pdf_page") or question_image_page(db, q["stem"], q.get("chunk_id"))
+    return value
 
 
 class AnswerInput(BaseModel):
@@ -1078,8 +1122,15 @@ def attempt_detail(attempt_id: int, user: User = Depends(current_user), db: Sess
     if not attempt.submitted_at and now() >= paper.ends_at:
         grade(db, attempt, paper)
     if not attempt.submitted_at:
-        return attempt_view(attempt, paper)
-    return out(attempt)
+        return attempt_view(attempt, paper, db)
+    value = out(attempt)
+    value["book_id"] = paper.book_id
+    for row in value["result"]:
+        if "image_pdf_page" not in row:
+            source = next((q for q in paper.snapshot if q["id"] == row["question_id"]), None)
+            row["image_pdf_page"] = (source or {}).get("image_pdf_page") or (
+                question_image_page(db, source["stem"], source.get("chunk_id")) if source else None)
+    return value
 
 
 @app.get("/api/my/attempts")
@@ -1150,7 +1201,10 @@ def create_practice(data: PracticeInput, user: User = Depends(roles("student", "
     practice = Practice(user_id=user.id, question_id=question.id, source_attempt_id=attempt.id, mode=data.mode)
     db.add(practice)
     db.commit()
-    return {"practice": out(practice), "question": question_public(question)}
+    knowledge = db.get(Knowledge, question.knowledge_id)
+    return {"practice": out(practice), "question": {**question_public(question),
+            "book_id": knowledge.book_id if knowledge else None,
+            "image_pdf_page": question_image_page(db, question.stem, question.chunk_id)}}
 
 
 class PracticeAnswer(BaseModel):
