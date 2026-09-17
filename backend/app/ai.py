@@ -160,6 +160,17 @@ def ocr_png(png: bytes) -> str:
     ]}])
 
 
+def vision_json(png: bytes, prompt: str) -> dict:
+    provider, model = _selected("vision")
+    encoded = base64.b64encode(png).decode()
+    raw = _request(provider, model, [{"role": "user", "content": [
+        {"type": "text", "text": prompt + " 只返回 JSON，不要 Markdown。"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}},
+    ]}], json_mode=True)
+    raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    return json.loads(raw)
+
+
 def test_model(provider: ModelProvider, model: str, vision: bool = False) -> dict:
     if vision:
         # A tiny generated PNG exercises the image input path without transmitting textbook content.

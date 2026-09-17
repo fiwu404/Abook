@@ -17,10 +17,12 @@ os.environ["UPLOAD_DIR"] = str(Path(tmp.name) / "uploads")
 os.environ["APP_SECRET"] = "test-secret-abcdefghijklmnopqrstuvwxyz-12345"
 os.environ["ADMIN_PASSWORD"] = "admin12345678"
 
-from app.db import now  # noqa: E402
+from app.db import SessionLocal, now  # noqa: E402
 from app.main import app  # noqa: E402
 from app.tasks import celery_app  # noqa: E402
 from app import ai  # noqa: E402
+from app.catalog import parse_toc_text  # noqa: E402
+from app.models import BookCatalog, Page  # noqa: E402
 
 
 celery_app.conf.task_always_eager = True
@@ -38,6 +40,7 @@ def headers(client, username, password):
 
 
 def test_reviewed_exam_and_invalidation(monkeypatch):
+    monkeypatch.setattr("app.tasks.vision_json", lambda png, prompt: {"chapter": "Unit 1", "confidence": "high"})
     pdf = pymupdf.open()
     page = pdf.new_page()
     page.insert_text((72, 72), "Photosynthesis converts sunlight into chemical energy in plants.")
@@ -54,10 +57,12 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         teacher = headers(client, "teacher_one", "teacher1234")
         assert client.get("/api/users", headers=teacher).status_code == 403
         book = ok(client.post("/api/books?title=Biology&version=1", headers=operator,
-                              files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")}))
+                              files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")},
+                              data={"manual_toc": "1|Unit 1|1"}))
         assert client.post("/api/books?title=Other&version=1", headers=teacher,
                            files={"file": ("book.pdf", io.BytesIO(body), "application/pdf")}).status_code == 403
         assert book["version"] == "1"
+        ok(client.post(f"/api/books/{book['id']}/confirm-toc", headers=operator))
         job = ok(client.post(f"/api/books/{book['id']}/parse", headers=operator))
         assert ok(client.get("/api/jobs", headers=operator))[0]["status"] == "done"
         pages = ok(client.get(f"/api/books/{book['id']}/pages", headers=operator))
@@ -166,3 +171,82 @@ def test_cloud_provider_models_selection_and_vision(monkeypatch):
         assert ai.structured("test") == {"ok": True}
         assert ai.ocr_png(b"png") == "TEST 123"
         assert any(b"image_url" in request.content for request in requests)
+
+
+def test_directory_first_and_on_demand_chapter_workflow(monkeypatch):
+    assert parse_toc_text("目录 CONTENTS\n项目1\n初识云计算与OpenStack 云计算平台........2")[0] == {
+        "level": 1, "title": "项目1 初识云计算与OpenStack 云计算平台", "printed_page": 2}
+    document = pymupdf.open()
+    for lines in [
+        ["Cloud textbook cover"],
+        ["CONTENTS", "Chapter 1 Cloud Basics........................1", "1.1 Introduction.............................1", "1.2 Concepts.................................2"],
+        ["Directory continued", "Chapter 2 Storage Basics......................3", "2.1 Storage types............................3", "2.2 Storage services.........................4"],
+        ["Chapter 1 Cloud Basics", "Cloud converts compute resources into services."],
+        ["Cloud services can be shared by several users."],
+        ["Chapter 2 Storage Basics", "Storage keeps data for later use."],
+    ]:
+        page = document.new_page()
+        for index, line in enumerate(lines):
+            page.insert_text((72, 72 + index * 24), line)
+    body = document.tobytes()
+    document.close()
+    calls = []
+
+    def classify(png, prompt):
+        calls.append(prompt)
+        expected = prompt.split("目录推定 ", 1)[1].split("。", 1)[0]
+        return {"chapter": expected, "confidence": "high"}
+
+    monkeypatch.setattr("app.tasks.vision_json", classify)
+    monkeypatch.setattr("app.tasks.ocr_png", lambda png: "前置内容")
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        book = ok(client.post("/api/books?title=Cloud%20Guide&version=1", headers=admin,
+                              files={"file": ("cloud.pdf", io.BytesIO(body), "application/pdf")}))
+        assert not book["toc"]
+        # Simulate a textbook imported by the old page-first parser.
+        with SessionLocal() as db:
+            db.delete(db.get(BookCatalog, book["id"]))
+            for number in range(1, 7):
+                db.add(Page(book_id=book["id"], pdf_page=number, printed_page=str(number),
+                            chapter="未分章", text="old page text", blocks=[{"text": "old page text", "bbox": []}], issues=[]))
+            db.commit()
+        assert client.post(f"/api/books/{book['id']}/parse", headers=admin).status_code == 400
+        job = ok(client.post(f"/api/books/{book['id']}/discover-toc", headers=admin))
+        assert job["status"] == "done"
+        catalog = ok(client.get(f"/api/books/{book['id']}/catalog", headers=admin))
+        assert [item["pdf_page"] for item in catalog["chapters"]] == [4, 6]
+        assert catalog["toc_pages"] == [2, 3]
+        assert [item["title"] for item in catalog["chapters"]] == ["Chapter 1 Cloud Basics", "Chapter 2 Storage Basics"]
+        assert catalog["confirmed"] is False
+        ok(client.post(f"/api/books/{book['id']}/confirm-toc", headers=admin))
+        parsed = ok(client.post(f"/api/books/{book['id']}/parse", headers=admin))
+        assert parsed["status"] == "done"
+        assert calls, "chapter boundaries must be checked by the vision model"
+        pages = ok(client.get(f"/api/books/{book['id']}/pages", headers=admin))
+        assert [page["chapter"] for page in pages] == ["前置内容", "前置内容", "前置内容",
+            "Chapter 1 Cloud Basics", "Chapter 1 Cloud Basics", "Chapter 2 Storage Basics"]
+        ok(client.post(f"/api/books/{book['id']}/confirm-mapping", headers=admin))
+        learning = ok(client.get(f"/api/books/{book['id']}/learning", headers=admin))
+        first = next(section for section in learning["sections"] if "Cloud converts" in section["text"])
+        quote = "Cloud converts compute resources into services."
+        monkeypatch.setattr("app.tasks.structured", lambda prompt: {"items": [{"chunk_id": first["chunk_id"],
+            "title": "Cloud services", "content": "Compute is offered as a service.", "source_quote": quote}]})
+        knowledge_job = ok(client.post(f"/api/books/{book['id']}/extract-knowledge", headers=admin,
+                                       json={"chapter": "Chapter 1 Cloud Basics"}))
+        assert knowledge_job["status"] == "done"
+        knowledge = ok(client.get(f"/api/books/{book['id']}/knowledge", headers=admin))
+        assert len(knowledge) == 1 and knowledge[0]["chapter"] == "Chapter 1 Cloud Basics"
+        ok(client.post(f"/api/knowledge/{knowledge[0]['id']}/review", headers=admin, json={"approve": True}))
+        monkeypatch.setattr("app.tasks.structured", lambda prompt: {
+            "stem": "What does cloud computing offer?",
+            "options": {"A": "Compute services", "B": "Paper", "C": "Ink", "D": "Coal"},
+            "answer": "A", "explanation": "The chapter describes compute resources as services.",
+            "evidence": quote, "difficulty": "easy"})
+        question_job = ok(client.post(f"/api/books/{book['id']}/generate-chapter-questions", headers=admin,
+                                       json={"chapter": "Chapter 1 Cloud Basics", "count": 1}))
+        assert question_job["status"] == "done"
+        questions = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
+        assert len(questions) == 1 and questions[0]["validation"] == []
+        assert client.post(f"/api/books/{book['id']}/extract-knowledge", headers=admin,
+                           json={"chapter": "前置内容"}).status_code == 400

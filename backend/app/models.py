@@ -46,6 +46,18 @@ class Book(Base):
     __table_args__ = (UniqueConstraint("title", "version"),)
 
 
+class BookCatalog(Base):
+    __tablename__ = "book_catalogs"
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), primary_key=True)
+    toc_pages: Mapped[list] = mapped_column(JSON, default=list)
+    source: Mapped[str] = mapped_column(String(20), default="pending")
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    warnings: Mapped[list] = mapped_column(JSON, default=list)
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
+    classified: Mapped[bool] = mapped_column(Boolean, default=False)
+    parse_revision: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class Page(Base):
     __tablename__ = "pages"
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -1,0 +1,11 @@
+[Unit]
+Description=Abook bridge from Docker gateway to local Ollama
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/Code/Abook/scripts/ollama_bridge.py --bind 172.17.0.1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

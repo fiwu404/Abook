@@ -1,11 +1,13 @@
 import hashlib
+import json
 import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+import pymupdf
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -15,8 +17,9 @@ from sqlalchemy.orm import Session
 
 from .ai import (config_view, encrypt_key, list_models, provider_view, seed_ai_settings,
                  test_model, validate_base_url)
+from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_page_spec, validate_toc
 from .db import Base, SessionLocal, engine, get_db, now
-from .models import AISettings, Attempt, Audit, Book, Chunk, Job, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
+from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
 from .security import bootstrap, check_password, current_user, hash_password, issue_token, roles
 from .services import audit, page_issues, question_public, question_snapshot, rebuild_chunks, validate_question
 from .tasks import run_job
@@ -258,6 +261,7 @@ def update_ai_config(data: AIConfigInput, user: User = Depends(roles("admin")), 
 
 @app.post("/api/books")
 async def upload_book(title: str, version: str, file: UploadFile = File(...),
+                      toc_pages: str = Form(""), manual_toc: str = Form(""),
                       user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "第一版仅支持 PDF")
@@ -267,14 +271,25 @@ async def upload_book(title: str, version: str, file: UploadFile = File(...),
     body = await file.read(maximum + 1)
     if len(body) > maximum or not body.startswith(b"%PDF-"):
         raise HTTPException(400, "PDF 无效或超过大小限制")
+    try:
+        with pymupdf.open(stream=body, filetype="pdf") as pdf:
+            page_count = len(pdf)
+        if not page_count:
+            raise ValueError("PDF 没有页面")
+        hints = parse_page_spec(toc_pages, page_count)
+        entries = parse_manual_toc(manual_toc, page_count) if manual_toc.strip() else []
+    except (ValueError, RuntimeError, pymupdf.FileDataError) as exc:
+        raise HTTPException(400, f"PDF 或目录设置无效：{exc}") from exc
     if db.scalar(select(Book).where(Book.title == title, Book.version == version)):
         raise HTTPException(409, "教材名称与版本已存在")
     sha = hashlib.sha256(body).hexdigest()
     path = Path(os.getenv("UPLOAD_DIR", "./data/uploads")) / f"{sha}.pdf"
     path.write_bytes(body)
-    book = Book(title=title.strip(), version=version.strip(), sha256=sha, file_path=str(path))
+    book = Book(title=title.strip(), version=version.strip(), sha256=sha, file_path=str(path),
+                page_count=page_count, toc=entries, status="toc_review" if entries else "uploaded")
     db.add(book)
     db.flush()
+    db.add(BookCatalog(book_id=book.id, toc_pages=hints, source="manual" if entries else "pending"))
     audit(db, "book", book.id, user.id, "upload", after={"title": book.title, "version": book.version, "sha256": sha})
     db.commit()
     return book_view(book)
@@ -299,7 +314,40 @@ def book_detail(book_id: int, user: User = Depends(current_user), db: Session = 
 @app.post("/api/books/{book_id}/parse")
 def parse_book(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
-    return out(enqueue(db, "parse", book.id, f"parse:{book.id}:{book.sha256}"))
+    catalog = db.get(BookCatalog, book.id)
+    if not book.toc or not catalog or not catalog.confirmed:
+        raise HTTPException(400, "请先解析并确认目录，再解析章节正文")
+    active = db.scalar(select(Job).where(Job.kind == "parse", Job.target_id == book.id,
+                                         Job.status.in_(["queued", "running", "retrying"])).order_by(Job.id.desc()))
+    if active:
+        return out(active)
+    catalog.parse_revision += 1
+    catalog.classified = False
+    book.mapping_confirmed = False
+    db.commit()
+    revision = hashlib.sha256(json.dumps(book.toc, ensure_ascii=False).encode()).hexdigest()[:12]
+    return out(enqueue(db, "parse", book.id, f"parse:{book.id}:{book.sha256}:{revision}:{catalog.parse_revision}"))
+
+
+@app.get("/api/books/{book_id}/catalog")
+def book_catalog(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    book = require(db.get(Book, book_id))
+    catalog = db.get(BookCatalog, book_id)
+    return {"toc": book.toc, "toc_pages": catalog.toc_pages if catalog else [],
+            "source": catalog.source if catalog else "pending", "raw_text": catalog.raw_text if catalog else "",
+            "warnings": catalog.warnings if catalog else [], "confirmed": catalog.confirmed if catalog else False,
+            "classified": catalog.classified if catalog else False,
+            "chapters": chapter_entries(book.toc)}
+
+
+@app.post("/api/books/{book_id}/discover-toc")
+def discover_toc(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    book = require(db.get(Book, book_id))
+    catalog = db.get(BookCatalog, book_id)
+    if catalog and catalog.confirmed:
+        raise HTTPException(400, "目录已经确认；如需重新解析，请先编辑目录")
+    hint_key = ",".join(map(str, catalog.toc_pages if catalog else []))
+    return out(enqueue(db, "toc", book.id, f"toc:{book.id}:{book.sha256}:{hint_key}"))
 
 
 @app.get("/api/books/{book_id}/pages")
@@ -324,18 +372,51 @@ class TocItem(BaseModel):
 @app.put("/api/books/{book_id}/toc")
 def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
-    if any(item.pdf_page > book.page_count or not item.title.strip() for item in items):
-        raise HTTPException(400, "书签页码或标题无效")
+    active = db.scalar(select(Job.id).where(Job.kind == "parse", Job.target_id == book_id,
+                                            Job.status.in_(["queued", "running", "retrying"])))
+    if active:
+        raise HTTPException(409, "章节解析正在进行，请先等待完成或取消任务")
+    try:
+        validated = validate_toc([item.model_dump() for item in items], book.page_count)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not validated:
+        raise HTTPException(400, "目录至少需要一个章节")
     before = {"toc": book.toc}
-    book.toc = [item.model_dump() for item in sorted(items, key=lambda x: x.pdf_page)]
+    book.toc = validated
+    catalog = db.get(BookCatalog, book_id)
+    if not catalog:
+        catalog = BookCatalog(book_id=book_id)
+        db.add(catalog)
+    catalog.source, catalog.confirmed = "manual", False
+    catalog.classified = False
+    book.mapping_confirmed = False
+    book.status = "toc_review"
     pages = db.scalars(select(Page).where(Page.book_id == book_id).order_by(Page.pdf_page)).all()
     for page in pages:
-        chapter = next((item["title"] for item in reversed(book.toc) if item["pdf_page"] <= page.pdf_page), "未分章")
-        if not page.revised and page.chapter != chapter:
+        chapter = chapter_for_page(book.toc, page.pdf_page)
+        if page.chapter != chapter:
             page.chapter = chapter
-            if book.mapping_confirmed:
+            if db.scalar(select(Chunk.id).where(Chunk.page_id == page.id, Chunk.active.is_(True))):
                 rebuild_chunks(db, page)
     audit(db, "book", book.id, user.id, "edit_toc", before, {"toc": book.toc})
+    db.commit()
+    return book_view(book)
+
+
+@app.post("/api/books/{book_id}/confirm-toc")
+def confirm_toc(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    book = require(db.get(Book, book_id))
+    if not chapter_entries(book.toc):
+        raise HTTPException(400, "请先建立章节目录")
+    catalog = db.get(BookCatalog, book_id)
+    if not catalog:
+        catalog = BookCatalog(book_id=book_id, source="manual")
+        db.add(catalog)
+    catalog.confirmed = True
+    book.status = "toc_ready"
+    book.mapping_confirmed = False
+    audit(db, "book", book.id, user.id, "confirm_toc", after={"chapters": len(chapter_entries(book.toc))})
     db.commit()
     return book_view(book)
 
@@ -344,6 +425,8 @@ def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("adm
 def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     page = require(db.get(Page, page_id))
     book = require(db.get(Book, page.book_id))
+    if data.chapter not in {"前置内容", *[item["title"] for item in chapter_entries(book.toc)]}:
+        raise HTTPException(400, "页面章节必须来自已确认的目录")
     before = out(page)
     changed_text = page.text != data.text or page.chapter != data.chapter
     page.printed_page, page.chapter, page.text = data.printed_page, data.chapter, data.text
@@ -358,9 +441,14 @@ def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("admin"))
 @app.post("/api/books/{book_id}/confirm-mapping")
 def confirm_mapping(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
+    catalog = db.get(BookCatalog, book_id)
+    if not catalog or not catalog.confirmed or not catalog.classified:
+        raise HTTPException(400, "请先确认目录并完成章节正文分类")
     pages = db.scalars(select(Page).where(Page.book_id == book_id).order_by(Page.pdf_page)).all()
     if not pages or len(pages) != book.page_count:
         raise HTTPException(400, "解析未完成，不能建立索引")
+    if not any(page.chapter in {item["title"] for item in chapter_entries(book.toc)} for page in pages):
+        raise HTTPException(400, "尚未将任何正文页归入目录章节")
     previous_number = None
     for page in pages:
         if not page.chapter.strip() or not page.printed_page.strip():
@@ -371,7 +459,11 @@ def confirm_mapping(book_id: int, user: User = Depends(roles("admin")), db: Sess
             issues.append(f"疑似缺少印刷页 {previous_number + 1}–{number - 1}，请核对原 PDF")
         page.issues = issues
         previous_number = number
-        if not db.scalar(select(Chunk).where(Chunk.page_id == page.id, Chunk.active.is_(True))):
+        active_chunks = db.scalars(select(Chunk).where(Chunk.page_id == page.id, Chunk.active.is_(True)).order_by(Chunk.position)).all()
+        source_texts = [part["text"].strip() for part in page.blocks if part.get("text", "").strip()]
+        if not source_texts and page.text.strip():
+            source_texts = [page.text.strip()]
+        if not active_chunks or any(chunk.chapter != page.chapter for chunk in active_chunks) or [chunk.text for chunk in active_chunks] != source_texts:
             rebuild_chunks(db, page)
     book.mapping_confirmed, book.status = True, "indexed"
     audit(db, "book", book.id, user.id, "confirm_mapping", after={"pages": len(pages)})
@@ -390,7 +482,8 @@ def learning(book_id: int, user: User = Depends(current_user), db: Session = Dep
     by_chunk = {}
     for item in knowledge:
         by_chunk.setdefault(item.chunk_id, []).append({"id": item.id, "title": item.title, "content": item.content, "source_quote": item.source_quote})
-    return {"book": book_view(book), "sections": [{"chunk_id": c.id, "chapter": c.chapter,
+    chapters = chapter_entries(book.toc)
+    return {"book": book_view(book), "chapters": chapters, "sections": [{"chunk_id": c.id, "chapter": c.chapter,
             "pdf_page": pages[c.page_id].pdf_page, "printed_page": pages[c.page_id].printed_page,
             "text": c.text, "bbox": c.bbox, "previous": c.previous, "following": c.following,
             "knowledge": by_chunk.get(c.id, [])} for c in chunks]}
@@ -420,13 +513,48 @@ def retry_job(job_id: int, user: User = Depends(roles("admin")), db: Session = D
     return out(enqueue(db, job.kind, job.target_id, job.key, job.payload))
 
 
+class ChapterRequest(BaseModel):
+    chapter: str
+
+
 @app.post("/api/books/{book_id}/extract-knowledge")
-def extract_knowledge(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def extract_knowledge(book_id: int, data: ChapterRequest, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
     if not book.mapping_confirmed:
         raise HTTPException(400, "请先确认目录与页码")
-    newest = db.scalar(select(Chunk.id).where(Chunk.book_id == book_id, Chunk.active.is_(True)).order_by(Chunk.id.desc())) or 0
-    return out(enqueue(db, "knowledge", book_id, f"knowledge:{book_id}:{newest}"))
+    if data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
+        raise HTTPException(400, "请选择目录中的一个章节")
+    newest = db.scalar(select(Chunk.id).where(Chunk.book_id == book_id, Chunk.chapter == data.chapter,
+                                               Chunk.active.is_(True)).order_by(Chunk.id.desc())) or 0
+    if not newest:
+        raise HTTPException(400, "该章节没有可用原文")
+    existing = db.scalar(select(func.count(Knowledge.id)).where(Knowledge.book_id == book_id,
+                        Knowledge.chapter == data.chapter, Knowledge.origin == "ai")) or 0
+    chapter_key = hashlib.sha256(data.chapter.encode()).hexdigest()[:12]
+    return out(enqueue(db, "knowledge", book_id, f"knowledge:{book_id}:{chapter_key}:{newest}:{existing}",
+                       {"chapter": data.chapter}))
+
+
+class ChapterQuestionsInput(ChapterRequest):
+    count: int = Field(ge=1, le=30)
+
+
+@app.post("/api/books/{book_id}/generate-chapter-questions")
+def generate_chapter_questions(book_id: int, data: ChapterQuestionsInput,
+                               user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    book = require(db.get(Book, book_id))
+    if not book.mapping_confirmed or data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
+        raise HTTPException(400, "请先确认目录与章节，并选择一个有效章节")
+    approved = db.scalar(select(func.count(Knowledge.id)).where(Knowledge.book_id == book_id,
+                        Knowledge.chapter == data.chapter, Knowledge.status == "approved", Knowledge.chunk_id.is_not(None))) or 0
+    if not approved:
+        raise HTTPException(400, "本章尚无已审核的教材知识点")
+    existing = db.scalar(select(func.count(Question.id)).join(Knowledge, Question.knowledge_id == Knowledge.id).where(
+        Knowledge.book_id == book_id, Knowledge.chapter == data.chapter)) or 0
+    chapter_key = hashlib.sha256(data.chapter.encode()).hexdigest()[:12]
+    return out(enqueue(db, "chapter_questions", book_id,
+        f"chapter_questions:{book_id}:{chapter_key}:{approved}:{existing}:{data.count}",
+        {"chapter": data.chapter, "count": data.count}))
 
 
 @app.get("/api/books/{book_id}/knowledge")
@@ -451,6 +579,8 @@ def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(ro
         raise HTTPException(400, "原文块不属于本教材当前版本")
     if chunk and data.source_quote not in chunk.text:
         raise HTTPException(400, "引用必须逐字来自原文块")
+    if chunk and data.chapter and data.chapter != chunk.chapter:
+        raise HTTPException(400, "知识点章节必须与原文块所属章节一致")
     item = Knowledge(book_id=book.id, chunk_id=data.chunk_id, title=data.title, content=data.content,
                      source_quote=data.source_quote, chapter=data.chapter or (chunk.chapter if chunk else "人工补充"), origin="manual")
     db.add(item)
@@ -467,6 +597,8 @@ def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends
     chunk = db.get(Chunk, data.chunk_id) if data.chunk_id else None
     if chunk and (chunk.book_id != item.book_id or not chunk.active or data.source_quote not in chunk.text):
         raise HTTPException(400, "原文引用无效")
+    if chunk and data.chapter and data.chapter != chunk.chapter:
+        raise HTTPException(400, "知识点章节必须与原文块所属章节一致")
     item.title, item.content, item.chunk_id, item.source_quote, item.chapter = data.title, data.content, data.chunk_id, data.source_quote, data.chapter or (chunk.chapter if chunk else "人工补充")
     item.revision += 1
     item.status = "draft"
@@ -485,10 +617,15 @@ class ReviewInput(BaseModel):
 @app.post("/api/knowledge/{knowledge_id}/review")
 def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     item = require(db.get(Knowledge, knowledge_id))
+    book = require(db.get(Book, item.book_id))
+    if data.approve and not book.mapping_confirmed:
+        raise HTTPException(400, "请先确认章节索引")
     if data.approve and item.chunk_id:
         chunk = db.get(Chunk, item.chunk_id)
         if not chunk or not chunk.active or not item.source_quote or item.source_quote not in chunk.text:
             raise HTTPException(400, "原文出处失效，请先修正")
+        if item.chapter != chunk.chapter:
+            raise HTTPException(400, "知识点章节与原文块不一致")
     if not item.title.strip() or not item.content.strip():
         raise HTTPException(400, "知识点内容不能为空")
     before = out(item)
@@ -501,6 +638,9 @@ def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(
 @app.post("/api/knowledge/{knowledge_id}/generate-question")
 def generate_question(knowledge_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     item = require(db.get(Knowledge, knowledge_id))
+    book = require(db.get(Book, item.book_id))
+    if not book.mapping_confirmed or item.chapter not in {entry["title"] for entry in chapter_entries(book.toc)}:
+        raise HTTPException(400, "请先确认章节索引和知识点所属章节")
     if item.status != "approved" or not item.chunk_id:
         raise HTTPException(400, "只有已审核且有教材出处的知识点可以出题")
     count = db.scalar(select(func.count(Question.id)).where(Question.knowledge_id == item.id)) or 0
@@ -527,6 +667,9 @@ def questions(book_id: int, user: User = Depends(roles("admin")), db: Session = 
 @app.post("/api/questions")
 def create_question(data: QuestionInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     knowledge = require(db.get(Knowledge, data.knowledge_id))
+    book = require(db.get(Book, knowledge.book_id))
+    if not book.mapping_confirmed:
+        raise HTTPException(400, "请先确认章节索引")
     if not knowledge.chunk_id:
         raise HTTPException(400, "题目必须绑定教材原文")
     question = Question(knowledge_id=knowledge.id, chunk_id=knowledge.chunk_id, stem=data.stem,
@@ -567,6 +710,10 @@ def revalidate(question_id: int, user: User = Depends(roles("admin")), db: Sessi
 @app.post("/api/questions/{question_id}/review")
 def review_question(question_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
+    knowledge = require(db.get(Knowledge, question.knowledge_id))
+    book = require(db.get(Book, knowledge.book_id))
+    if data.approve and not book.mapping_confirmed:
+        raise HTTPException(400, "请先确认章节索引")
     before = out(question)
     question.validation = validate_question(db, question)
     if data.approve and question.validation:
@@ -580,6 +727,7 @@ def review_question(question_id: int, data: ReviewInput, user: User = Depends(ro
 class PaperInput(BaseModel):
     book_id: int
     title: str
+    chapter: str = ""
     knowledge_ids: list[int]
     question_count: int = Field(ge=1, le=100)
     score_each: int = Field(ge=1, le=100)
@@ -588,8 +736,15 @@ class PaperInput(BaseModel):
 
 @app.post("/api/papers")
 def create_paper(data: PaperInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    require(db.get(Book, data.book_id))
-    allowed_ids = set(db.scalars(select(Knowledge.id).where(Knowledge.book_id == data.book_id, Knowledge.status == "approved")).all())
+    book = require(db.get(Book, data.book_id))
+    if not book.mapping_confirmed:
+        raise HTTPException(400, "请先确认章节索引")
+    if data.chapter and data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
+        raise HTTPException(400, "试卷章节不在目录中")
+    allowed_query = select(Knowledge.id).where(Knowledge.book_id == data.book_id, Knowledge.status == "approved")
+    if data.chapter:
+        allowed_query = allowed_query.where(Knowledge.chapter == data.chapter)
+    allowed_ids = set(db.scalars(allowed_query).all())
     if not data.knowledge_ids or not set(data.knowledge_ids).issubset(allowed_ids):
         raise HTTPException(400, "请选择本教材已审核知识点")
     pool = db.scalars(select(Question).where(Question.knowledge_id.in_(data.knowledge_ids), Question.status == "approved").order_by(Question.id)).all()

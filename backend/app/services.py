@@ -63,7 +63,7 @@ def validate_question(db: Session, question: Question) -> list[str]:
         errors.append("解析不能为空")
     chunk = db.get(Chunk, question.chunk_id)
     knowledge = db.get(Knowledge, question.knowledge_id)
-    if not chunk or not knowledge or knowledge.chunk_id != question.chunk_id:
+    if not chunk or not knowledge or knowledge.chunk_id != question.chunk_id or knowledge.chapter != chunk.chapter:
         errors.append("知识点与原文出处不匹配")
     elif not question.evidence.strip() or question.evidence.strip() not in chunk.text:
         errors.append("依据必须逐字出现在原文内容块中")
