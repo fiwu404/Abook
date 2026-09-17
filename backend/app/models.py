@@ -174,6 +174,13 @@ class Job(Base):
     created_at: Mapped[object] = mapped_column(DateTime, default=now)
 
 
+class JobDismissal(Base):
+    __tablename__ = "job_dismissals"
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[object] = mapped_column(DateTime, default=now)
+
+
 class Audit(Base):
     __tablename__ = "audits"
     id: Mapped[int] = mapped_column(primary_key=True)

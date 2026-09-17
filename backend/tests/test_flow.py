@@ -19,11 +19,11 @@ os.environ["APP_SECRET"] = "test-secret-abcdefghijklmnopqrstuvwxyz-12345"
 os.environ["ADMIN_PASSWORD"] = "admin12345678"
 
 from app.db import SessionLocal, now  # noqa: E402
-from app.main import app  # noqa: E402
+from app.main import app, enqueue  # noqa: E402
 from app.tasks import _knowledge_batches, _source_weight, _verbatim_quote, celery_app  # noqa: E402
 from app import ai  # noqa: E402
 from app.catalog import chapter_entries, expand_heading_indices, parse_toc_text  # noqa: E402
-from app.models import BookCatalog, ModelProvider, Page, Paper  # noqa: E402
+from app.models import BookCatalog, Job, JobDismissal, ModelProvider, Page, Paper  # noqa: E402
 
 
 celery_app.conf.task_always_eager = True
@@ -495,3 +495,38 @@ def test_textbook_library_and_heading_scoped_questions(monkeypatch):
             created_knowledge[0]["id"], created_knowledge[1]["id"]}
         assert any("所选目录标题：Chapter 7 Networks、7.2 Network devices" in prompt
                    for prompt in generated_prompts)
+
+
+def test_admin_can_clear_finished_job_list_without_losing_task_records(monkeypatch):
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        ok(client.post("/api/users", headers=admin, json={
+            "username": "teacher_cleanup", "password": "teacher1234", "role": "teacher"}))
+        teacher = headers(client, "teacher_cleanup", "teacher1234")
+        with SessionLocal() as db:
+            jobs = [Job(key=f"cleanup:{status}", kind="parse", target_id=0, status=status)
+                    for status in ("done", "failed", "cancelled", "queued", "running", "retrying")]
+            db.add_all(jobs)
+            db.commit()
+            ids = {job.status: job.id for job in jobs}
+        assert client.delete("/api/jobs", headers=teacher).status_code == 403
+        assert ok(client.delete("/api/jobs", headers=admin))["cleared"] >= 3
+        visible = {job["id"] for job in ok(client.get("/api/jobs", headers=admin))}
+        assert all(ids[status] not in visible for status in ("done", "failed", "cancelled"))
+        assert all(ids[status] in visible for status in ("queued", "running", "retrying"))
+        assert ok(client.delete("/api/jobs", headers=admin))["cleared"] == 0
+        with SessionLocal() as db:
+            assert db.get(Job, ids["done"]).status == "done"
+            assert db.get(JobDismissal, ids["done"]).actor_id is not None
+            assert db.get(JobDismissal, ids["running"]) is None
+            db.get(Job, ids["running"]).status = "done"
+            db.commit()
+        assert ids["running"] in {job["id"] for job in ok(client.get("/api/jobs", headers=admin))}
+        assert ok(client.delete("/api/jobs", headers=admin))["cleared"] == 1
+        monkeypatch.setattr("app.main.run_job.apply_async", lambda args: SimpleNamespace(id="cleanup-retry"))
+        retried = ok(client.post(f"/api/jobs/{ids['failed']}/retry", headers=admin))
+        assert retried["status"] == "queued"
+        assert ids["failed"] in {job["id"] for job in ok(client.get("/api/jobs", headers=admin))}
+        with SessionLocal() as db:
+            assert enqueue(db, "parse", 0, "cleanup:done").id == ids["done"]
+        assert ids["done"] in {job["id"] for job in ok(client.get("/api/jobs", headers=admin))}

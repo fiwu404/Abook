@@ -20,7 +20,7 @@ from .ai import (config_view, encrypt_key, list_models, provider_view, seed_ai_s
                  test_model, validate_base_url)
 from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_page_spec, validate_toc
 from .db import Base, SessionLocal, engine, get_db, now
-from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
+from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, JobDismissal, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
 from .security import bootstrap, check_password, current_user, hash_password, issue_token, roles
 from .services import audit, blocking_question_errors, page_issues, question_public, question_snapshot, rebuild_chunks, scoped_knowledge, validate_question
 from .tasks import run_job
@@ -79,10 +79,17 @@ def active_knowledge(db: Session, knowledge_id: int) -> Knowledge:
 def enqueue(db: Session, kind: str, target: int, key: str, payload=None):
     job = db.scalar(select(Job).where(Job.key == key))
     if job and job.status in ("queued", "running", "retrying", "done"):
+        dismissal = db.get(JobDismissal, job.id)
+        if dismissal:
+            db.delete(dismissal)
+            db.commit()
         return job
     if job:
         job.status, job.progress, job.total, job.error, job.cancel_requested = "queued", 0, 0, "", False
         job.payload = payload or {}
+        dismissal = db.get(JobDismissal, job.id)
+        if dismissal:
+            db.delete(dismissal)
     else:
         job = Job(key=key, kind=kind, target_id=target, payload=payload or {})
         db.add(job)
@@ -534,7 +541,19 @@ def learning(book_id: int, user: User = Depends(current_user), db: Session = Dep
 
 @app.get("/api/jobs")
 def jobs(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    return out(db.scalars(select(Job).order_by(Job.id.desc()).limit(50)).all())
+    dismissed = select(JobDismissal.job_id)
+    return out(db.scalars(select(Job).where(Job.id.not_in(dismissed)).order_by(Job.id.desc()).limit(50)).all())
+
+
+@app.delete("/api/jobs")
+def clear_finished_jobs(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+    dismissed = select(JobDismissal.job_id)
+    finished = db.scalars(select(Job).where(Job.status.in_(("done", "failed", "cancelled")),
+                                            Job.id.not_in(dismissed)).with_for_update()).all()
+    for job in finished:
+        db.add(JobDismissal(job_id=job.id, actor_id=user.id))
+    db.commit()
+    return {"cleared": len(finished)}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
