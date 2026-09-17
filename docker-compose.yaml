@@ -1,0 +1,67 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: abook
+      MYSQL_USER: abook
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-abook_dev_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_dev_password}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  backend:
+    build: ./backend
+    environment: &backend_env
+      DATABASE_URL: mysql+pymysql://abook:${MYSQL_PASSWORD:-abook_dev_password}@mysql:3306/abook?charset=utf8mb4
+      CELERY_BROKER_URL: redis://redis:6379/0
+      APP_SECRET: ${APP_SECRET:-change-this-secret-before-deploying-1234567890}
+      OPERATOR_USER: ${OPERATOR_USER:-operator}
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:-operator1234}
+      REVIEWER_USER: ${REVIEWER_USER:-reviewer}
+      REVIEWER_PASSWORD: ${REVIEWER_PASSWORD:-reviewer1234}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      TEXT_MODEL: ${TEXT_MODEL:-}
+      OCR_MODEL: ${OCR_MODEL:-}
+      UPLOAD_DIR: /app/data/uploads
+      CORS_ORIGINS: http://localhost:5173
+    volumes:
+      - uploads:/app/data/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  worker:
+    build: ./backend
+    command: celery -A app.tasks.celery_app worker --loglevel=INFO --concurrency=${WORKER_CONCURRENCY:-2}
+    environment: *backend_env
+    volumes:
+      - uploads:/app/data/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+volumes:
+  mysql_data:
+  uploads:
