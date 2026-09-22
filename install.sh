@@ -3,17 +3,47 @@ set -Eeuo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yaml"
+REPO_URL="https://github.com/fiwu404/Abook"
+REPO_BRANCH="main"
 INIT_SERVICE="secret-init"
 INIT_MARKER_KEY="cc.fiwu.abook.cleanup.role"
 INIT_MARKER_VALUE="secret-init-v1"
 WAIT_TIMEOUT="${DEPLOY_WAIT_TIMEOUT:-180}"
 RUNNING_SERVICES=(mysql redis backend worker beat frontend)
 COMPOSE=(docker compose --project-directory "${PROJECT_DIR}" -f "${COMPOSE_FILE}")
+AFTER_PULL_ARG="--deploy-after-pull"
 
 fail() {
   echo "部署失败：$*" >&2
   exit 1
 }
+
+normalize_repo_url() {
+  local value="${1%/}"
+  printf '%s\n' "${value%.git}"
+}
+
+if [[ "${1:-}" != "${AFTER_PULL_ARG}" ]]; then
+  [[ "$#" -eq 0 ]] || fail "不支持的参数：$*"
+  command -v git >/dev/null 2>&1 || fail "找不到 git 命令"
+  git_root="$(git -C "${PROJECT_DIR}" rev-parse --show-toplevel 2>/dev/null)" || fail "当前目录不是 Git 仓库"
+  git_root="$(cd -- "${git_root}" && pwd -P)"
+  [[ "${git_root}" == "${PROJECT_DIR}" ]] || fail "install.sh 必须位于 Git 仓库根目录"
+  branch="$(git -C "${PROJECT_DIR}" symbolic-ref --quiet --short HEAD)" || fail "当前处于 detached HEAD，无法安全更新"
+  [[ "${branch}" == "${REPO_BRANCH}" ]] || fail "当前分支是 ${branch}，要求分支为 ${REPO_BRANCH}"
+  origin_url="$(git -C "${PROJECT_DIR}" remote get-url origin 2>/dev/null)" || fail "没有配置 origin 远程仓库"
+  [[ "$(normalize_repo_url "${origin_url}")" == "$(normalize_repo_url "${REPO_URL}")" ]] || \
+    fail "origin 地址不匹配：${origin_url}"
+  tracked_changes="$(git -C "${PROJECT_DIR}" status --porcelain --untracked-files=no)"
+  [[ -z "${tracked_changes}" ]] || fail "存在未提交的已跟踪文件修改，请先提交或还原后再部署"
+
+  echo "正在从 ${REPO_URL} 更新 ${REPO_BRANCH}……"
+  git -C "${PROJECT_DIR}" pull --ff-only origin "${REPO_BRANCH}"
+  [[ -x "${PROJECT_DIR}/install.sh" ]] || fail "更新后的 install.sh 不存在或不可执行"
+  exec "${PROJECT_DIR}/install.sh" "${AFTER_PULL_ARG}"
+fi
+shift
+[[ "$#" -eq 0 ]] || fail "不支持的参数：$*"
 
 command -v docker >/dev/null 2>&1 || fail "找不到 docker 命令"
 [[ "${WAIT_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || fail "DEPLOY_WAIT_TIMEOUT 必须是正整数"
