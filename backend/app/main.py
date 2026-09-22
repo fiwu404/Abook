@@ -6,6 +6,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pymupdf
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -18,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .ai import (config_view, encrypt_key, list_models, provider_view, seed_ai_settings,
-                 test_model, validate_base_url)
+                 test_connection, test_model, validate_base_url)
 from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_page_spec, validate_toc
 from .db import Base, SessionLocal, engine, get_db, now
 from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, JobDismissal, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
@@ -293,21 +294,44 @@ class ProviderInput(BaseModel):
     api_key: str = ""
 
 
-def provider_data(data: ProviderInput):
-    if data.api_style not in {"ollama", "openai"}:
+class ProviderConnectionInput(BaseModel):
+    base_url: str = Field(min_length=1, max_length=500)
+    api_style: str = "openai"
+    api_key: str = ""
+
+
+def provider_base_url(base_url: str, api_style: str):
+    if api_style not in {"ollama", "openai"}:
         raise HTTPException(400, "接口类型仅支持 Ollama 或 OpenAI 兼容")
     try:
-        base_url = validate_base_url(data.base_url)
+        base_url = validate_base_url(base_url)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if api_style == "ollama" and not urlsplit(base_url).path.rstrip("/"):
+        base_url += "/v1"
+    return base_url
+
+
+def provider_data(data: ProviderInput):
     if not data.display_name.strip():
         raise HTTPException(400, "显示名称不能为空")
-    return base_url
+    return provider_base_url(data.base_url, data.api_style)
 
 
 @app.get("/api/providers")
 def providers(user: User = Depends(permits("models.view")), db: Session = Depends(get_db)):
     return [provider_view(p) for p in db.scalars(select(ModelProvider).order_by(ModelProvider.id)).all()]
+
+
+@app.post("/api/providers/test-connection")
+def check_provider_connection(data: ProviderConnectionInput, user: User = Depends(permits("models.manage"))):
+    base_url = provider_base_url(data.base_url, data.api_style)
+    provider = ModelProvider(display_name="连接测试", base_url=base_url, api_style=data.api_style,
+                             api_key_cipher=encrypt_key(data.api_key) if data.api_key else None)
+    try:
+        return test_connection(provider)
+    except Exception as exc:
+        raise HTTPException(502, f"连接测试失败：{str(exc)[:300]}") from exc
 
 
 @app.post("/api/providers")

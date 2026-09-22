@@ -102,6 +102,13 @@ def list_models(provider: ModelProvider) -> list[str]:
                    for item in entries if isinstance(item, dict) and item.get("name" if provider.api_style == "ollama" else "id")})
 
 
+def test_connection(provider: ModelProvider) -> dict:
+    start = time.monotonic()
+    models = list_models(provider)
+    return {"ok": True, "latency_ms": round((time.monotonic() - start) * 1000),
+            "models": models, "model_count": len(models)}
+
+
 def _request(provider: ModelProvider, model: str, messages: list[dict], json_mode: bool = False,
              timeout: float = 300) -> str:
     if not model:

@@ -261,6 +261,35 @@ def test_cloud_provider_models_selection_and_vision(monkeypatch):
         assert any(b"image_url" in request.content for request in requests)
 
 
+def test_remote_ollama_address_port_and_connection_test(monkeypatch):
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert str(request.url) == "http://192.168.50.20:22434/api/tags"
+        return httpx.Response(200, json={"models": [{"name": "qwen3-vl:4b"}, {"name": "qwen3:8b"}]})
+
+    monkeypatch.setattr(ai, "_client",
+                        lambda timeout: httpx.Client(transport=httpx.MockTransport(respond), timeout=timeout))
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        tested = ok(client.post("/api/providers/test-connection", headers=admin, json={
+            "base_url": "http://192.168.50.20:22434/v1", "api_style": "ollama"}))
+        assert tested["ok"] is True
+        assert tested["model_count"] == 2
+        assert tested["models"] == ["qwen3-vl:4b", "qwen3:8b"]
+
+        saved = ok(client.post("/api/providers", headers=admin, json={
+            "display_name": "远程 Ollama", "base_url": "http://192.168.50.20:22434",
+            "api_style": "ollama", "api_key": ""}))
+        assert saved["base_url"] == "http://192.168.50.20:22434/v1"
+        assert ok(client.get(f"/api/providers/{saved['id']}/models", headers=admin))["models"] == [
+            "qwen3-vl:4b", "qwen3:8b"]
+        assert len(requests) == 2
+        assert client.post("/api/providers/test-connection", headers=admin, json={
+            "base_url": "http://192.168.50.20:70000/v1", "api_style": "ollama"}).status_code == 400
+
+
 def test_granular_permissions_create_and_update_immediately():
     with TestClient(app) as client:
         admin = headers(client, "admin", "admin12345678")

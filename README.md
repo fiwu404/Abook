@@ -13,9 +13,9 @@ docker compose up --build
 
 ### 模型配置
 
-首次启动会将环境变量中的默认模型写入数据库。默认连接**宿主机运行的 Ollama**：`MODEL_BASE_URL=http://host.docker.internal:11434/v1`，文本模型为 `qwen3-vl:8b`，扫描页 OCR 模型为 `qwen3-vl:4b`。Docker Compose 通过 `extra_hosts: host.docker.internal:host-gateway` 从普通桥接网络访问宿主机，未使用 host 网络模式。[Ollama 的 OpenAI 兼容接口](https://docs.ollama.com/api/openai-compatibility)支持此 `/v1/chat/completions` 地址；[Docker 的 host-gateway 映射](https://docs.docker.com/compose/how-tos/networking/)用于桥接容器访问宿主机。
+首次启动会将环境变量中的默认模型写入数据库。默认连接**宿主机运行的 Ollama**：`MODEL_BASE_URL=http://host.docker.internal:11434/v1`，文本模型为 `qwen3-vl:8b`，扫描页 OCR 模型为 `qwen3-vl:4b`。模型接入页也支持本机、局域网及远程 Ollama：选择 Ollama 后分别填写 HTTP/HTTPS、主机地址和端口，点击“测试连接”即可检查 `/api/tags` 并显示发现的模型，保存后再为文本与视觉任务选择具体模型。Docker Compose 通过 `extra_hosts: host.docker.internal:host-gateway` 从普通桥接网络访问宿主机，未使用 host 网络模式。[Ollama 的 OpenAI 兼容接口](https://docs.ollama.com/api/openai-compatibility)支持此 `/v1/chat/completions` 地址；[Docker 的 host-gateway 映射](https://docs.docker.com/compose/how-tos/networking/)用于桥接容器访问宿主机。
 
-admin 可在“模型接入”添加或编辑提供商，填写显示名称、API 根地址、接口类型和可选密钥。支持 Ollama 与提供 `/models`、`/chat/completions` 的 OpenAI 兼容云端接口。选择提供商后点击“获取支持的模型”，再分别选择文本模型和视觉 OCR 模型；“测试可用性”会向所选模型发送实际的文本或图片请求，测试通过后保存模型选择。后续也可直接向 `model_providers` 表添加提供商，刷新页面即可显示；云端密钥建议通过管理页面填写。密钥在数据库中加密，接口只返回是否已设置；更换 `APP_SECRET` 后需重新填写密钥。模型查询使用 Ollama 的模型列表接口或 [OpenAI 兼容的模型列表接口](https://platform.openai.com/docs/api-reference/models/list)。
+admin 可在“模型接入”添加或编辑提供商。Ollama 使用协议、主机地址和端口配置，OpenAI 兼容提供商使用 API 根地址和可选密钥。选择提供商后点击“获取支持的模型”，再分别选择文本模型和视觉 OCR 模型；“测试可用性”会向所选模型发送实际的文本或图片请求，测试通过后保存模型选择。后续也可直接向 `model_providers` 表添加提供商，刷新页面即可显示；云端密钥建议通过管理页面填写。密钥在数据库中加密，接口只返回是否已设置；更换 `APP_SECRET` 后需重新填写密钥。模型查询使用 Ollama 的模型列表接口或 [OpenAI 兼容的模型列表接口](https://platform.openai.com/docs/api-reference/models/list)。
 
 如果 Ollama 只监听 `127.0.0.1:11434`，容器无法直接访问。仓库提供了一个仅监听 Docker 网关地址的[本机转发服务](scripts/ollama_bridge.py)，把容器请求转发给回环地址上的 Ollama；无需修改 Ollama 服务，也不使用 Docker host 网络模式。当前机器的 `docker0` 地址为 `172.17.0.1`，用户级 systemd 服务已启用。新环境可在仓库根目录执行：
 
