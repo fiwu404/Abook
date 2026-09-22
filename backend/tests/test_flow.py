@@ -99,6 +99,13 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         question = ok(client.post("/api/questions", headers=operator, json=question_data))
         assert question["validation"] == []
         ok(client.post(f"/api/questions/{question['id']}/review", headers=reviewer, json={"approve": True}))
+        draft = ok(client.post("/api/papers", headers=operator, json={"book_id": book["id"],
+            "title": "Discarded draft", "knowledge_ids": [knowledge["id"]], "question_count": 1,
+            "score_each": 10, "difficulty": "any"}))
+        assert next(p for p in ok(client.get("/api/papers", headers=operator)) if p["id"] == draft["id"])["can_delete"] is True
+        assert client.delete(f"/api/papers/{draft['id']}", headers=teacher).status_code == 403
+        assert ok(client.delete(f"/api/papers/{draft['id']}", headers=operator))["deleted"] is True
+        assert all(p["id"] != draft["id"] for p in ok(client.get("/api/papers", headers=operator)))
         paper = ok(client.post("/api/papers", headers=operator, json={"book_id": book["id"],
             "title": "Unit quiz", "knowledge_ids": [knowledge["id"]], "question_count": 1,
             "score_each": 10, "difficulty": "any"}))
@@ -106,6 +113,7 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         end = now() + timedelta(minutes=30)
         ok(client.post(f"/api/papers/{paper['id']}/publish", headers=operator,
                        json={"starts_at": start.isoformat(), "ends_at": end.isoformat()}))
+        assert next(p for p in ok(client.get("/api/papers", headers=operator)) if p["id"] == paper["id"])["can_delete"] is False
         assert client.delete(f"/api/papers/{paper['id']}", headers=operator).status_code == 400
         ended_paper = ok(client.post("/api/papers", headers=operator, json={"book_id": book["id"],
             "title": "Finished quiz", "knowledge_ids": [knowledge["id"]], "question_count": 1,
@@ -115,6 +123,7 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         with SessionLocal() as db:
             db.get(Paper, ended_paper["id"]).ends_at = now() - timedelta(seconds=1)
             db.commit()
+        assert next(p for p in ok(client.get("/api/papers", headers=operator)) if p["id"] == ended_paper["id"])["can_delete"] is True
         assert ok(client.delete(f"/api/papers/{ended_paper['id']}", headers=operator))["deleted"] is True
         assert client.get(f"/api/papers/{ended_paper['id']}", headers=operator).status_code == 404
         assert "snapshot" not in ok(client.get(f"/api/papers/{paper['id']}", headers=teacher))
@@ -203,6 +212,7 @@ def test_reviewed_exam_and_invalidation(monkeypatch):
         assert client.post(f"/api/papers/{paper['id']}/terminate", headers=teacher).status_code == 403
         terminated = ok(client.post(f"/api/papers/{paper['id']}/terminate", headers=operator))
         assert terminated["status"] == "terminated"
+        assert next(p for p in ok(client.get("/api/papers", headers=operator)) if p["id"] == paper["id"])["can_delete"] is True
         assert ok(client.get(f"/api/attempts/{open_attempt['id']}", headers=open_student))["score"] == 10
         assert client.post(f"/api/papers/{paper['id']}/start", headers=open_student).status_code == 400
         assert client.patch(f"/api/papers/{paper['id']}/schedule", headers=operator,
@@ -249,6 +259,94 @@ def test_cloud_provider_models_selection_and_vision(monkeypatch):
         assert ai.structured("test") == {"ok": True}
         assert ai.ocr_png(b"png") == "TEST 123"
         assert any(b"image_url" in request.content for request in requests)
+
+
+def test_granular_permissions_create_and_update_immediately():
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        catalog = ok(client.get("/api/permissions", headers=admin))
+        assert {"users.manage", "jobs.manage", "models.view", "audits.view"}.issubset(
+            {item["code"] for item in catalog})
+
+        manager = ok(client.post("/api/users", headers=admin, json={
+            "username": "permission_manager", "password": "manager1234", "role": "teacher",
+            "permissions": ["users.manage"]}))
+        assert {"users.manage", "users.view"}.issubset(set(manager["permissions"]))
+        manager_headers = headers(client, "permission_manager", "manager1234")
+        assert client.get("/api/users", headers=manager_headers).status_code == 200
+
+        child = ok(client.post("/api/users", headers=manager_headers, json={
+            "username": "permission_child", "password": "student1234", "role": "student",
+            "permissions": ["jobs.manage"]}))
+        assert set(child["permissions"]) == {"jobs.manage", "jobs.view"}
+        child_headers = headers(client, "permission_child", "student1234")
+        assert client.get("/api/jobs", headers=child_headers).status_code == 200
+        assert client.get("/api/providers", headers=child_headers).status_code == 403
+
+        changed = ok(client.put(f"/api/users/{child['id']}/permissions", headers=manager_headers,
+                                json={"permissions": ["models.view"]}))
+        assert changed["permissions"] == ["models.view"]
+        assert client.get("/api/providers", headers=child_headers).status_code == 200
+        assert client.get("/api/jobs", headers=child_headers).status_code == 403
+        assert client.post("/api/providers", headers=child_headers, json={
+            "display_name": "forbidden", "base_url": "http://localhost:11434", "api_style": "ollama"}).status_code == 403
+        assert client.put(f"/api/users/{child['id']}/permissions", headers=manager_headers,
+                          json={"permissions": ["unknown.permission"]}).status_code == 400
+
+        admin_id = ok(client.get("/api/auth/me", headers=admin))["id"]
+        assert client.put(f"/api/users/{admin_id}/permissions", headers=admin,
+                          json={"permissions": []}).status_code == 400
+
+
+def test_account_rename_password_reset_and_required_change():
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        account = ok(client.post("/api/users", headers=admin, json={
+            "username": "lifecycle_user", "password": "initial1234", "role": "student",
+            "permissions": ["jobs.view"], "must_change_password": True}))
+        assert account["must_change_password"] is True
+
+        first_login = ok(client.post("/api/auth/login", json={
+            "username": "lifecycle_user", "password": "initial1234"}))
+        forced_headers = {"Authorization": "Bearer " + first_login["token"]}
+        assert first_login["user"]["must_change_password"] is True
+        assert ok(client.get("/api/auth/me", headers=forced_headers))["username"] == "lifecycle_user"
+        assert client.get("/api/jobs", headers=forced_headers).status_code == 403
+        assert client.put("/api/auth/password", headers=forced_headers, json={
+            "current_password": "incorrect", "new_password": "personal1234"}).status_code == 400
+
+        changed = ok(client.put("/api/auth/password", headers=forced_headers, json={
+            "current_password": "initial1234", "new_password": "personal1234"}))
+        personal_headers = {"Authorization": "Bearer " + changed["token"]}
+        assert changed["user"]["must_change_password"] is False
+        assert client.get("/api/auth/me", headers=forced_headers).status_code == 401
+        assert client.get("/api/jobs", headers=personal_headers).status_code == 200
+
+        renamed = ok(client.put(f"/api/users/{account['id']}", headers=admin,
+                                json={"username": "lifecycle_renamed"}))
+        assert renamed["username"] == "lifecycle_renamed"
+        assert client.post("/api/auth/login", json={
+            "username": "lifecycle_user", "password": "personal1234"}).status_code == 401
+        renamed_login = ok(client.post("/api/auth/login", json={
+            "username": "lifecycle_renamed", "password": "personal1234"}))
+        renamed_headers = {"Authorization": "Bearer " + renamed_login["token"]}
+
+        reset = ok(client.post(f"/api/users/{account['id']}/reset-password", headers=admin, json={
+            "password": "restored1234", "must_change_password": True}))
+        assert reset["must_change_password"] is True
+        assert client.get("/api/auth/me", headers=renamed_headers).status_code == 401
+        assert client.post("/api/auth/login", json={
+            "username": "lifecycle_renamed", "password": "personal1234"}).status_code == 401
+        restored_login = ok(client.post("/api/auth/login", json={
+            "username": "lifecycle_renamed", "password": "restored1234"}))
+        assert restored_login["user"]["must_change_password"] is True
+
+        manager = ok(client.post("/api/users", headers=admin, json={
+            "username": "lifecycle_manager", "password": "manager1234", "role": "teacher",
+            "permissions": ["users.manage"]}))
+        manager_headers = headers(client, "lifecycle_manager", "manager1234")
+        assert client.post(f"/api/users/{manager['id']}/reset-password", headers=manager_headers, json={
+            "password": "replacement1234", "must_change_password": True}).status_code == 400
 
 
 def test_ollama_vision_json_parser_failure_falls_back(monkeypatch):
@@ -593,7 +691,12 @@ def test_figure_question_shows_original_pdf_page_in_review_and_exam(monkeypatch)
         ok(client.post(f"/api/questions/{question['id']}/review", headers=admin, json={"approve": True}))
         reviewed = ok(client.get(f"/api/questions?book_id={book['id']}", headers=admin))
         assert reviewed[0]["image_pdf_page"] == 1
-        assert client.get(f"/api/books/{book['id']}/pages/1/image", headers=student).content.startswith(b"\x89PNG")
+        full_page = client.get(f"/api/books/{book['id']}/pages/1/image", headers=student)
+        cropped = client.get(
+            f"/api/books/{book['id']}/pages/1/chunks/{chunk_id}/image", headers=student)
+        assert full_page.content.startswith(b"\x89PNG") and cropped.content.startswith(b"\x89PNG")
+        full_pixmap, crop_pixmap = pymupdf.Pixmap(full_page.content), pymupdf.Pixmap(cropped.content)
+        assert crop_pixmap.width < full_pixmap.width and crop_pixmap.height < full_pixmap.height
         paper = ok(client.post("/api/papers", headers=admin, json={
             "book_id": book["id"], "title": "Figure exam", "chapter": "Figures",
             "question_ids": [question["id"]], "question_count": 1,
@@ -610,10 +713,12 @@ def test_figure_question_shows_original_pdf_page_in_review_and_exam(monkeypatch)
             db.commit()
         attempt = ok(client.post(f"/api/papers/{paper['id']}/start", headers=student))
         assert attempt["book_id"] == book["id"] and attempt["questions"][0]["image_pdf_page"] == 1
+        assert attempt["questions"][0]["image_chunk_id"] == chunk_id
         ok(client.put(f"/api/attempts/{attempt['id']}/answer", headers=student,
                       json={"question_id": question["id"], "answer": "B"}))
         ok(client.post(f"/api/attempts/{attempt['id']}/submit", headers=student))
         result = ok(client.get(f"/api/attempts/{attempt['id']}", headers=student))
         assert result["result"][0]["image_pdf_page"] == 1
+        assert result["result"][0]["image_chunk_id"] == chunk_id
         ok(client.delete(f"/api/books/{book['id']}", headers=admin))
         assert client.get(f"/api/books/{book['id']}/pages/1/image", headers=student).content.startswith(b"\x89PNG")

@@ -22,8 +22,12 @@ from .ai import (config_view, encrypt_key, list_models, provider_view, seed_ai_s
 from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_page_spec, validate_toc
 from .db import Base, SessionLocal, engine, get_db, now
 from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, JobDismissal, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
-from .security import bootstrap, check_password, current_user, hash_password, issue_token, roles
-from .services import audit, blocking_question_errors, page_issues, question_image_page, question_public, question_snapshot, rebuild_chunks, scoped_knowledge, validate_question
+from .security import (PERMISSION_CATALOG, ROLE_DEFAULTS, bootstrap, check_password, current_user,
+                       hash_password, has_permission, initialize_permissions, issue_token, permits,
+                       set_user_permissions, user_permissions, user_security)
+from .services import (audit, blocking_question_errors, chunk_figure_spec, page_issues,
+                       question_image_page, question_public, question_snapshot, rebuild_chunks,
+                       scoped_knowledge, validate_question)
 from .tasks import run_job
 
 
@@ -35,6 +39,7 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         bootstrap(db)
+        initialize_permissions(db)
         seed_ai_settings(db)
     yield
 
@@ -118,10 +123,36 @@ class Credentials(BaseModel):
 
 class NewUser(Credentials):
     role: str
+    permissions: list[str] | None = None
+    must_change_password: bool = False
+
+
+class PermissionUpdate(BaseModel):
+    permissions: list[str] = Field(default_factory=list)
+
+
+class UserUpdate(BaseModel):
+    username: str
+
+
+class PasswordReset(BaseModel):
+    password: str
+    must_change_password: bool = True
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
+
+def user_view(db: Session, user: User):
+    return {"id": user.id, "username": user.username, "role": user.role,
+            "permissions": sorted(user_permissions(db, user)),
+            "must_change_password": user_security(db, user).must_change_password}
 
 
 @app.post("/api/users")
-def create_user(data: NewUser, actor: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def create_user(data: NewUser, actor: User = Depends(permits("users.manage")), db: Session = Depends(get_db)):
     if not re.fullmatch(r"[A-Za-z0-9_]{3,40}", data.username) or len(data.password) < 8:
         raise HTTPException(400, "用户名须为 3-40 位字母、数字或下划线，密码至少 8 位")
     if data.role not in {"teacher", "student"}:
@@ -130,18 +161,81 @@ def create_user(data: NewUser, actor: User = Depends(roles("admin")), db: Sessio
     db.add(user)
     try:
         db.flush()
-        audit(db, "user", user.id, actor.id, "create", after={"username": user.username, "role": user.role})
+        state = user_security(db, user)
+        state.must_change_password = data.must_change_password
+        granted = set_user_permissions(db, user, data.permissions if data.permissions is not None else ROLE_DEFAULTS[data.role])
+        audit(db, "user", user.id, actor.id, "create",
+              after={"username": user.username, "role": user.role, "permissions": sorted(granted)})
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "用户名已存在")
-    return {"id": user.id, "username": user.username, "role": user.role}
+    return user_view(db, user)
 
 
 @app.get("/api/users")
-def list_users(actor: User = Depends(roles("admin")), db: Session = Depends(get_db)):
-    return [{"id": user.id, "username": user.username, "role": user.role}
-            for user in db.scalars(select(User).order_by(User.id)).all()]
+def list_users(actor: User = Depends(permits("users.view")), db: Session = Depends(get_db)):
+    return [user_view(db, user) for user in db.scalars(select(User).order_by(User.id)).all()]
+
+
+@app.get("/api/permissions")
+def permission_catalog(actor: User = Depends(permits("users.view"))):
+    return PERMISSION_CATALOG
+
+
+@app.put("/api/users/{user_id}/permissions")
+def update_user_permissions(user_id: int, data: PermissionUpdate,
+                            actor: User = Depends(permits("users.manage")), db: Session = Depends(get_db)):
+    target = require(db.get(User, user_id), "用户不存在")
+    if target.role == "admin":
+        raise HTTPException(400, "admin 始终拥有全部权限，无需单独修改")
+    before = sorted(user_permissions(db, target))
+    granted = sorted(set_user_permissions(db, target, data.permissions))
+    audit(db, "user", target.id, actor.id, "permissions", before={"permissions": before},
+          after={"permissions": granted})
+    db.commit()
+    return user_view(db, target)
+
+
+@app.put("/api/users/{user_id}")
+def update_user(user_id: int, data: UserUpdate, actor: User = Depends(permits("users.manage")),
+                db: Session = Depends(get_db)):
+    target = require(db.get(User, user_id), "用户不存在")
+    if target.role == "admin":
+        raise HTTPException(400, "admin 用户名由系统配置管理，不能在此修改")
+    username = data.username.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,40}", username):
+        raise HTTPException(400, "用户名须为 3-40 位字母、数字或下划线")
+    before = {"username": target.username}
+    target.username = username
+    try:
+        db.flush()
+        audit(db, "user", target.id, actor.id, "rename", before=before, after={"username": username})
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "用户名已存在")
+    return user_view(db, target)
+
+
+@app.post("/api/users/{user_id}/reset-password")
+def reset_password(user_id: int, data: PasswordReset, actor: User = Depends(permits("users.manage")),
+                   db: Session = Depends(get_db)):
+    target = require(db.get(User, user_id), "用户不存在")
+    if target.role == "admin":
+        raise HTTPException(400, "不能在此重置 admin 密码")
+    if target.id == actor.id:
+        raise HTTPException(400, "当前登录账号请通过修改密码页面处理")
+    if len(data.password) < 8:
+        raise HTTPException(400, "初始密码至少 8 位")
+    target.password_hash = hash_password(data.password)
+    state = user_security(db, target)
+    state.must_change_password = data.must_change_password
+    state.token_version += 1
+    audit(db, "user", target.id, actor.id, "reset_password",
+          after={"must_change_password": state.must_change_password})
+    db.commit()
+    return user_view(db, target)
 
 
 @app.post("/api/auth/login")
@@ -149,12 +243,30 @@ def login(data: Credentials, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.username == data.username))
     if not user or user.role not in {"admin", "teacher", "student"} or not check_password(data.password, user.password_hash):
         raise HTTPException(401, "用户名或密码错误")
-    return {"token": issue_token(user), "user": {"id": user.id, "username": user.username, "role": user.role}}
+    state = user_security(db, user)
+    return {"token": issue_token(user, state.token_version), "user": user_view(db, user)}
 
 
 @app.get("/api/auth/me")
-def me(user: User = Depends(current_user)):
-    return {"id": user.id, "username": user.username, "role": user.role}
+def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return user_view(db, user)
+
+
+@app.put("/api/auth/password")
+def change_password(data: PasswordChange, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if not check_password(data.current_password, user.password_hash):
+        raise HTTPException(400, "当前密码错误")
+    if len(data.new_password) < 8:
+        raise HTTPException(400, "新密码至少 8 位")
+    if data.current_password == data.new_password:
+        raise HTTPException(400, "新密码不能与当前密码相同")
+    user.password_hash = hash_password(data.new_password)
+    state = user_security(db, user)
+    state.must_change_password = False
+    state.token_version += 1
+    audit(db, "user", user.id, user.id, "change_password")
+    db.commit()
+    return {"token": issue_token(user, state.token_version), "user": user_view(db, user)}
 
 
 @app.get("/api/health")
@@ -163,7 +275,7 @@ def health():
 
 
 @app.get("/api/ai/status")
-def ai_status(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def ai_status(user: User = Depends(permits("models.view")), db: Session = Depends(get_db)):
     config = config_view(db)
     providers = {provider.id: provider for provider in db.scalars(select(ModelProvider)).all()}
     details = {}
@@ -194,12 +306,12 @@ def provider_data(data: ProviderInput):
 
 
 @app.get("/api/providers")
-def providers(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def providers(user: User = Depends(permits("models.view")), db: Session = Depends(get_db)):
     return [provider_view(p) for p in db.scalars(select(ModelProvider).order_by(ModelProvider.id)).all()]
 
 
 @app.post("/api/providers")
-def create_provider(data: ProviderInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def create_provider(data: ProviderInput, user: User = Depends(permits("models.manage")), db: Session = Depends(get_db)):
     base_url = provider_data(data)
     provider = ModelProvider(display_name=data.display_name.strip(), base_url=base_url, api_style=data.api_style,
                              api_key_cipher=encrypt_key(data.api_key) if data.api_key else None)
@@ -215,7 +327,7 @@ def create_provider(data: ProviderInput, user: User = Depends(roles("admin")), d
 
 
 @app.put("/api/providers/{provider_id}")
-def update_provider(provider_id: int, data: ProviderInput, user: User = Depends(roles("admin")),
+def update_provider(provider_id: int, data: ProviderInput, user: User = Depends(permits("models.manage")),
                     db: Session = Depends(get_db)):
     provider = require(db.get(ModelProvider, provider_id))
     base_url = provider_data(data)
@@ -233,7 +345,7 @@ def update_provider(provider_id: int, data: ProviderInput, user: User = Depends(
 
 
 @app.get("/api/providers/{provider_id}/models")
-def provider_models(provider_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def provider_models(provider_id: int, user: User = Depends(permits("models.view")), db: Session = Depends(get_db)):
     provider = require(db.get(ModelProvider, provider_id))
     try:
         return {"models": list_models(provider)}
@@ -247,7 +359,7 @@ class ModelTest(BaseModel):
 
 
 @app.post("/api/providers/{provider_id}/test")
-def check_model(provider_id: int, data: ModelTest, user: User = Depends(roles("admin")),
+def check_model(provider_id: int, data: ModelTest, user: User = Depends(permits("models.manage")),
                 db: Session = Depends(get_db)):
     provider = require(db.get(ModelProvider, provider_id))
     try:
@@ -257,7 +369,7 @@ def check_model(provider_id: int, data: ModelTest, user: User = Depends(roles("a
 
 
 @app.get("/api/ai/config")
-def get_ai_config(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def get_ai_config(user: User = Depends(permits("models.view")), db: Session = Depends(get_db)):
     return config_view(db)
 
 
@@ -269,7 +381,7 @@ class AIConfigInput(BaseModel):
 
 
 @app.put("/api/ai/config")
-def update_ai_config(data: AIConfigInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def update_ai_config(data: AIConfigInput, user: User = Depends(permits("models.manage")), db: Session = Depends(get_db)):
     for provider_id in {data.text_provider_id, data.vision_provider_id}:
         require(db.get(ModelProvider, provider_id), "提供商不存在")
     settings = require(db.get(AISettings, 1))
@@ -286,7 +398,7 @@ def update_ai_config(data: AIConfigInput, user: User = Depends(roles("admin")), 
 @app.post("/api/books")
 async def upload_book(title: str, file: UploadFile = File(...),
                       toc_pages: str = Form(""), manual_toc: str = Form(""),
-                      user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+                      user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "第一版仅支持 PDF")
     title = title.strip()
@@ -321,23 +433,23 @@ async def upload_book(title: str, file: UploadFile = File(...),
 
 
 @app.get("/api/books")
-def books(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def books(user: User = Depends(permits("books.view")), db: Session = Depends(get_db)):
     query = select(Book).where(Book.status != "deleted").order_by(Book.id.desc())
-    if user.role != "admin":
+    if not has_permission(db, user, "books.manage"):
         query = query.where(Book.mapping_confirmed.is_(True))
     return [book_view(book) for book in db.scalars(query).all()]
 
 
 @app.get("/api/books/{book_id}")
-def book_detail(book_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def book_detail(book_id: int, user: User = Depends(permits("books.view")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
-    if user.role != "admin" and not book.mapping_confirmed:
+    if not has_permission(db, user, "books.manage") and not book.mapping_confirmed:
         raise HTTPException(404, "教材不存在")
     return book_view(book)
 
 
 @app.delete("/api/books/{book_id}")
-def delete_book(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def delete_book(book_id: int, user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
     if book.status == "deleted":
         return {"id": book_id, "deleted": True}
@@ -356,7 +468,7 @@ def delete_book(book_id: int, user: User = Depends(roles("admin")), db: Session 
 
 
 @app.post("/api/books/{book_id}/parse")
-def parse_book(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def parse_book(book_id: int, user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book.id)
     if not book.toc or not catalog or not catalog.confirmed:
@@ -374,7 +486,7 @@ def parse_book(book_id: int, user: User = Depends(roles("admin")), db: Session =
 
 
 @app.get("/api/books/{book_id}/catalog")
-def book_catalog(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def book_catalog(book_id: int, user: User = Depends(permits("books.view")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book_id)
     return {"toc": book.toc, "toc_pages": catalog.toc_pages if catalog else [],
@@ -385,7 +497,7 @@ def book_catalog(book_id: int, user: User = Depends(roles("admin")), db: Session
 
 
 @app.post("/api/books/{book_id}/discover-toc")
-def discover_toc(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def discover_toc(book_id: int, user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book_id)
     if catalog and catalog.confirmed:
@@ -395,15 +507,15 @@ def discover_toc(book_id: int, user: User = Depends(roles("admin")), db: Session
 
 
 @app.get("/api/books/{book_id}/pages")
-def pages(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def pages(book_id: int, user: User = Depends(permits("books.view")), db: Session = Depends(get_db)):
     active_book(db, book_id)
     return out(db.scalars(select(Page).where(Page.book_id == book_id).order_by(Page.pdf_page)).all())
 
 
 @app.get("/api/books/{book_id}/pages/{pdf_page}/image")
-def page_image(book_id: int, pdf_page: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def page_image(book_id: int, pdf_page: int, user: User = Depends(permits("books.view")), db: Session = Depends(get_db)):
     book = require(db.get(Book, book_id))
-    if user.role != "admin" and not (book.status != "deleted" and book.mapping_confirmed):
+    if not has_permission(db, user, "books.manage") and not (book.status != "deleted" and book.mapping_confirmed):
         attempted = db.scalar(select(Attempt.id).join(Paper, Attempt.paper_id == Paper.id).where(
             Attempt.user_id == user.id, Paper.book_id == book_id))
         if not attempted:
@@ -417,6 +529,29 @@ def page_image(book_id: int, pdf_page: int, user: User = Depends(current_user), 
             png = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).tobytes("png")
     except (FileNotFoundError, pymupdf.FileDataError, IndexError) as exc:
         raise HTTPException(404, "PDF 原页不可用") from exc
+    return Response(png, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/api/books/{book_id}/pages/{pdf_page}/chunks/{chunk_id}/image")
+def figure_image(book_id: int, pdf_page: int, chunk_id: int,
+                 user: User = Depends(permits("books.view")), db: Session = Depends(get_db)):
+    book = require(db.get(Book, book_id))
+    spec = chunk_figure_spec(db, chunk_id)
+    if not spec or spec["book_id"] != book_id or spec["pdf_page"] != pdf_page:
+        raise HTTPException(404, "未能可靠定位题目对应的教材插图")
+    if not has_permission(db, user, "books.manage") and not (book.status != "deleted" and book.mapping_confirmed):
+        attempted = db.scalar(select(Attempt.id).join(Paper, Attempt.paper_id == Paper.id).where(
+            Attempt.user_id == user.id, Paper.book_id == book_id))
+        if not attempted:
+            raise HTTPException(403, "无权查看教材插图")
+    try:
+        with pymupdf.open(book.file_path) as pdf:
+            page = pdf[pdf_page - 1]
+            clip = pymupdf.Rect(spec["clip"])
+            scale = min(2.4, 1500 / max(clip.width, clip.height))
+            png = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=clip, alpha=False).tobytes("png")
+    except (FileNotFoundError, pymupdf.FileDataError, IndexError) as exc:
+        raise HTTPException(404, "教材插图不可用") from exc
     return Response(png, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
 
 
@@ -434,7 +569,7 @@ class TocItem(BaseModel):
 
 
 @app.put("/api/books/{book_id}/toc")
-def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     active = db.scalar(select(Job.id).where(Job.kind == "parse", Job.target_id == book_id,
                                             Job.status.in_(["queued", "running", "retrying"])))
@@ -476,7 +611,7 @@ def edit_toc(book_id: int, items: list[TocItem], user: User = Depends(roles("adm
 
 
 @app.post("/api/books/{book_id}/confirm-toc")
-def confirm_toc(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def confirm_toc(book_id: int, user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     if not chapter_entries(book.toc):
         raise HTTPException(400, "请先建立章节目录")
@@ -493,7 +628,7 @@ def confirm_toc(book_id: int, user: User = Depends(roles("admin")), db: Session 
 
 
 @app.patch("/api/pages/{page_id}")
-def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def edit_page(page_id: int, data: PageEdit, user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     page = require(db.get(Page, page_id))
     book = active_book(db, page.book_id)
     if data.chapter not in {"前置内容", *[item["title"] for item in chapter_entries(book.toc)]}:
@@ -510,7 +645,7 @@ def edit_page(page_id: int, data: PageEdit, user: User = Depends(roles("admin"))
 
 
 @app.post("/api/books/{book_id}/confirm-mapping")
-def confirm_mapping(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def confirm_mapping(book_id: int, user: User = Depends(permits("books.manage")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     catalog = db.get(BookCatalog, book_id)
     if not catalog or not catalog.confirmed or not catalog.classified:
@@ -543,7 +678,7 @@ def confirm_mapping(book_id: int, user: User = Depends(roles("admin")), db: Sess
 
 
 @app.get("/api/books/{book_id}/learning")
-def learning(book_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def learning(book_id: int, user: User = Depends(permits("books.view")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     if not book.mapping_confirmed:
         raise HTTPException(400, "教材尚未建立索引")
@@ -561,13 +696,13 @@ def learning(book_id: int, user: User = Depends(current_user), db: Session = Dep
 
 
 @app.get("/api/jobs")
-def jobs(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def jobs(user: User = Depends(permits("jobs.view")), db: Session = Depends(get_db)):
     dismissed = select(JobDismissal.job_id)
     return out(db.scalars(select(Job).where(Job.id.not_in(dismissed)).order_by(Job.id.desc()).limit(50)).all())
 
 
 @app.delete("/api/jobs")
-def clear_finished_jobs(user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def clear_finished_jobs(user: User = Depends(permits("jobs.manage")), db: Session = Depends(get_db)):
     dismissed = select(JobDismissal.job_id)
     finished = db.scalars(select(Job).where(Job.status.in_(("done", "failed", "cancelled")),
                                             Job.id.not_in(dismissed)).with_for_update()).all()
@@ -578,7 +713,7 @@ def clear_finished_jobs(user: User = Depends(roles("admin")), db: Session = Depe
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def cancel_job(job_id: int, user: User = Depends(permits("jobs.manage")), db: Session = Depends(get_db)):
     job = require(db.get(Job, job_id))
     if job.status in ("queued", "running", "retrying"):
         job.cancel_requested = True
@@ -589,7 +724,7 @@ def cancel_job(job_id: int, user: User = Depends(roles("admin")), db: Session = 
 
 
 @app.post("/api/jobs/{job_id}/retry")
-def retry_job(job_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def retry_job(job_id: int, user: User = Depends(permits("jobs.manage")), db: Session = Depends(get_db)):
     job = require(db.get(Job, job_id))
     if job.status not in ("failed", "cancelled"):
         raise HTTPException(400, "只能重试失败或已取消的任务")
@@ -601,7 +736,7 @@ class ChapterRequest(BaseModel):
 
 
 @app.post("/api/books/{book_id}/extract-knowledge")
-def extract_knowledge(book_id: int, data: ChapterRequest, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def extract_knowledge(book_id: int, data: ChapterRequest, user: User = Depends(permits("knowledge.edit")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     if not book.mapping_confirmed:
         raise HTTPException(400, "请先确认目录与页码")
@@ -625,7 +760,7 @@ class ChapterQuestionsInput(ChapterRequest):
 
 @app.post("/api/books/{book_id}/generate-chapter-questions")
 def generate_chapter_questions(book_id: int, data: ChapterQuestionsInput,
-                               user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+                               user: User = Depends(permits("questions.edit")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     if not book.mapping_confirmed or data.chapter not in {item["title"] for item in chapter_entries(book.toc)}:
         raise HTTPException(400, "请先确认目录与章节，并选择一个有效章节")
@@ -647,7 +782,7 @@ def generate_chapter_questions(book_id: int, data: ChapterQuestionsInput,
 
 
 @app.get("/api/books/{book_id}/knowledge")
-def list_knowledge(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def list_knowledge(book_id: int, user: User = Depends(permits("knowledge.view")), db: Session = Depends(get_db)):
     active_book(db, book_id)
     return out(db.scalars(select(Knowledge).where(Knowledge.book_id == book_id,
         Knowledge.status != "deleted").order_by(Knowledge.id.desc())).all())
@@ -662,7 +797,7 @@ class KnowledgeInput(BaseModel):
 
 
 @app.post("/api/books/{book_id}/knowledge")
-def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(permits("knowledge.edit")), db: Session = Depends(get_db)):
     book = active_book(db, book_id)
     chunk = db.get(Chunk, data.chunk_id) if data.chunk_id else None
     if chunk and (chunk.book_id != book.id or not chunk.active):
@@ -681,7 +816,7 @@ def create_knowledge(book_id: int, data: KnowledgeInput, user: User = Depends(ro
 
 
 @app.patch("/api/knowledge/{knowledge_id}")
-def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends(permits("knowledge.edit")), db: Session = Depends(get_db)):
     item = active_knowledge(db, knowledge_id)
     active_book(db, item.book_id)
     before = out(item)
@@ -701,7 +836,7 @@ def edit_knowledge(knowledge_id: int, data: KnowledgeInput, user: User = Depends
 
 
 @app.delete("/api/knowledge/{knowledge_id}")
-def delete_knowledge(knowledge_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def delete_knowledge(knowledge_id: int, user: User = Depends(permits("knowledge.edit")), db: Session = Depends(get_db)):
     item = require(db.get(Knowledge, knowledge_id))
     if item.status == "deleted":
         return {"id": knowledge_id, "deleted": True}
@@ -726,7 +861,7 @@ class ReviewInput(BaseModel):
 
 
 @app.post("/api/knowledge/{knowledge_id}/review")
-def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(permits("knowledge.review")), db: Session = Depends(get_db)):
     item = active_knowledge(db, knowledge_id)
     book = active_book(db, item.book_id)
     if data.approve and not book.mapping_confirmed:
@@ -747,7 +882,7 @@ def review_knowledge(knowledge_id: int, data: ReviewInput, user: User = Depends(
 
 
 @app.post("/api/knowledge/{knowledge_id}/generate-question")
-def generate_question(knowledge_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def generate_question(knowledge_id: int, user: User = Depends(permits("questions.edit")), db: Session = Depends(get_db)):
     item = active_knowledge(db, knowledge_id)
     book = active_book(db, item.book_id)
     if not book.mapping_confirmed or item.chapter not in {entry["title"] for entry in chapter_entries(book.toc)}:
@@ -770,7 +905,7 @@ class QuestionInput(BaseModel):
 
 
 @app.get("/api/questions")
-def questions(book_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def questions(book_id: int, user: User = Depends(permits("questions.view")), db: Session = Depends(get_db)):
     active_book(db, book_id)
     ids = select(Knowledge.id).where(Knowledge.book_id == book_id, Knowledge.status != "deleted")
     items = db.scalars(select(Question).where(Question.knowledge_id.in_(ids)).order_by(Question.id.desc())).all()
@@ -778,7 +913,7 @@ def questions(book_id: int, user: User = Depends(roles("admin")), db: Session = 
 
 
 @app.post("/api/questions")
-def create_question(data: QuestionInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def create_question(data: QuestionInput, user: User = Depends(permits("questions.edit")), db: Session = Depends(get_db)):
     knowledge = active_knowledge(db, data.knowledge_id)
     book = active_book(db, knowledge.book_id)
     if not book.mapping_confirmed:
@@ -797,7 +932,7 @@ def create_question(data: QuestionInput, user: User = Depends(roles("admin")), d
 
 
 @app.patch("/api/questions/{question_id}")
-def edit_question(question_id: int, data: QuestionInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def edit_question(question_id: int, data: QuestionInput, user: User = Depends(permits("questions.edit")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
     old_knowledge = active_knowledge(db, question.knowledge_id)
     active_book(db, old_knowledge.book_id)
@@ -818,7 +953,7 @@ def edit_question(question_id: int, data: QuestionInput, user: User = Depends(ro
 
 
 @app.post("/api/questions/{question_id}/validate")
-def revalidate(question_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def revalidate(question_id: int, user: User = Depends(permits("questions.edit")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
     knowledge = active_knowledge(db, question.knowledge_id)
     active_book(db, knowledge.book_id)
@@ -828,7 +963,7 @@ def revalidate(question_id: int, user: User = Depends(roles("admin")), db: Sessi
 
 
 @app.post("/api/questions/{question_id}/review")
-def review_question(question_id: int, data: ReviewInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def review_question(question_id: int, data: ReviewInput, user: User = Depends(permits("questions.review")), db: Session = Depends(get_db)):
     question = require(db.get(Question, question_id))
     knowledge = active_knowledge(db, question.knowledge_id)
     book = active_book(db, knowledge.book_id)
@@ -860,7 +995,7 @@ class PaperInput(BaseModel):
 
 
 @app.post("/api/papers")
-def create_paper(data: PaperInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def create_paper(data: PaperInput, user: User = Depends(permits("papers.manage")), db: Session = Depends(get_db)):
     book = active_book(db, data.book_id)
     if not book.mapping_confirmed:
         raise HTTPException(400, "请先确认章节索引")
@@ -913,13 +1048,20 @@ def create_paper(data: PaperInput, user: User = Depends(roles("admin")), db: Ses
     return out(paper)
 
 
+def paper_can_delete(paper: Paper) -> bool:
+    return paper.status in {"draft", "terminated"} or (
+        paper.status == "published" and paper.ends_at is not None and paper.ends_at <= now())
+
+
 @app.get("/api/papers")
-def papers(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def papers(user: User = Depends(permits("papers.view")), db: Session = Depends(get_db)):
     query = select(Paper).where(Paper.status != "deleted").order_by(Paper.id.desc())
-    if user.role != "admin":
+    manager = has_permission(db, user, "papers.manage")
+    if not manager:
         query = query.where(Paper.status == "published")
-    result = out(db.scalars(query).all())
-    if user.role != "admin":
+    items = db.scalars(query).all()
+    result = [{**out(paper), "can_delete": paper_can_delete(paper)} for paper in items] if manager else out(items)
+    if not manager:
         for paper in result:
             paper.pop("snapshot", None)
             paper.pop("rule", None)
@@ -927,11 +1069,11 @@ def papers(user: User = Depends(current_user), db: Session = Depends(get_db)):
 
 
 @app.get("/api/papers/{paper_id}")
-def paper_detail(paper_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def paper_detail(paper_id: int, user: User = Depends(permits("papers.view")), db: Session = Depends(get_db)):
     paper = require(db.get(Paper, paper_id))
     if paper.status == "deleted":
         raise HTTPException(404, "试卷已删除")
-    if user.role != "admin":
+    if not has_permission(db, user, "papers.manage"):
         if paper.status != "published":
             raise HTTPException(404, "试卷不存在")
         return {"id": paper.id, "title": paper.title, "total_score": paper.total_score,
@@ -949,7 +1091,7 @@ def _utc_naive(value: datetime) -> datetime:
 
 
 @app.post("/api/papers/{paper_id}/publish")
-def publish(paper_id: int, data: PublishInput, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def publish(paper_id: int, data: PublishInput, user: User = Depends(permits("papers.manage")), db: Session = Depends(get_db)):
     paper = require(db.get(Paper, paper_id))
     active_book(db, paper.book_id)
     if paper.status != "draft":
@@ -974,7 +1116,7 @@ def publish(paper_id: int, data: PublishInput, user: User = Depends(roles("admin
 
 @app.patch("/api/papers/{paper_id}/schedule")
 def change_paper_schedule(paper_id: int, data: PublishInput,
-                          user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+                          user: User = Depends(permits("papers.manage")), db: Session = Depends(get_db)):
     paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
     if paper.status != "published":
         raise HTTPException(400, "只能修改已发布且未终止的考试时间")
@@ -1002,7 +1144,7 @@ def _grade_open_attempts(db: Session, paper: Paper):
 
 
 @app.post("/api/papers/{paper_id}/terminate")
-def terminate_paper(paper_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def terminate_paper(paper_id: int, user: User = Depends(permits("papers.manage")), db: Session = Depends(get_db)):
     paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
     if paper.status != "published" or paper.ends_at <= now():
         raise HTTPException(400, "只能提前终止尚未结束的已发布考试")
@@ -1016,12 +1158,13 @@ def terminate_paper(paper_id: int, user: User = Depends(roles("admin")), db: Ses
 
 
 @app.delete("/api/papers/{paper_id}")
-def delete_paper(paper_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def delete_paper(paper_id: int, user: User = Depends(permits("papers.manage")), db: Session = Depends(get_db)):
     paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
-    if paper.status != "terminated" and not (paper.status == "published" and paper.ends_at <= now()):
-        raise HTTPException(400, "只有已结束或已终止的试卷可以删除")
+    if not paper_can_delete(paper):
+        raise HTTPException(400, "只能删除草稿、已结束或已终止的试卷")
     before = out(paper)
-    _grade_open_attempts(db, paper)
+    if paper.status != "draft":
+        _grade_open_attempts(db, paper)
     paper.status = "deleted"
     audit(db, "paper", paper.id, user.id, "delete", before, out(paper))
     db.commit()
@@ -1035,19 +1178,20 @@ def grade(db: Session, attempt: Attempt, paper: Paper, commit: bool = True):
     for item in paper.snapshot:
         answer = (attempt.answers or {}).get(str(item["id"]), "")
         correct = answer == item["answer"]
+        image_page = question_image_page(db, item["stem"], item.get("chunk_id"))
         result.append({"question_id": item["id"], "knowledge_id": item["knowledge_id"],
                        "answer": answer, "correct": correct, "score": item["score"] if correct else 0,
                        "correct_answer": item["answer"], "explanation": item["explanation"],
                        "evidence": item["evidence"], "stem": item["stem"], "options": item["options"],
-                       "image_pdf_page": item.get("image_pdf_page") or
-                       question_image_page(db, item["stem"], item.get("chunk_id"))})
+                       "image_pdf_page": image_page,
+                       "image_chunk_id": item.get("chunk_id") if image_page else None})
     attempt.result, attempt.score, attempt.submitted_at = result, sum(r["score"] for r in result), now()
     if commit:
         db.commit()
 
 
 @app.post("/api/papers/{paper_id}/start")
-def start_exam(paper_id: int, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def start_exam(paper_id: int, user: User = Depends(permits("exams.take")), db: Session = Depends(get_db)):
     paper = require(db.scalar(select(Paper).where(Paper.id == paper_id).with_for_update()))
     if paper.status != "published":
         raise HTTPException(400, "考试尚未发布")
@@ -1078,7 +1222,8 @@ def attempt_view(attempt: Attempt, paper: Paper, db: Session):
 
 def question_public_from_snapshot(q, db: Session):
     value = {key: q[key] for key in ("id", "stem", "options", "score", "knowledge_id")}
-    value["image_pdf_page"] = q.get("image_pdf_page") or question_image_page(db, q["stem"], q.get("chunk_id"))
+    value["image_pdf_page"] = question_image_page(db, q["stem"], q.get("chunk_id"))
+    value["image_chunk_id"] = q.get("chunk_id") if value["image_pdf_page"] else None
     return value
 
 
@@ -1088,7 +1233,7 @@ class AnswerInput(BaseModel):
 
 
 @app.put("/api/attempts/{attempt_id}/answer")
-def save_answer(attempt_id: int, data: AnswerInput, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def save_answer(attempt_id: int, data: AnswerInput, user: User = Depends(permits("exams.take")), db: Session = Depends(get_db)):
     attempt = require(db.scalar(select(Attempt).where(Attempt.id == attempt_id).with_for_update()))
     paper = db.get(Paper, attempt.paper_id)
     if attempt.user_id != user.id:
@@ -1105,7 +1250,7 @@ def save_answer(attempt_id: int, data: AnswerInput, user: User = Depends(roles("
 
 
 @app.post("/api/attempts/{attempt_id}/submit")
-def submit(attempt_id: int, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def submit(attempt_id: int, user: User = Depends(permits("exams.take")), db: Session = Depends(get_db)):
     attempt = require(db.scalar(select(Attempt).where(Attempt.id == attempt_id).with_for_update()))
     if attempt.user_id != user.id:
         raise HTTPException(403, "无权访问")
@@ -1114,7 +1259,7 @@ def submit(attempt_id: int, user: User = Depends(roles("student", "admin")), db:
 
 
 @app.get("/api/attempts/{attempt_id}")
-def attempt_detail(attempt_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def attempt_detail(attempt_id: int, user: User = Depends(permits("results.view")), db: Session = Depends(get_db)):
     attempt = require(db.get(Attempt, attempt_id))
     if user.role != "admin" and attempt.user_id != user.id:
         raise HTTPException(403, "无权访问")
@@ -1126,15 +1271,18 @@ def attempt_detail(attempt_id: int, user: User = Depends(current_user), db: Sess
     value = out(attempt)
     value["book_id"] = paper.book_id
     for row in value["result"]:
-        if "image_pdf_page" not in row:
-            source = next((q for q in paper.snapshot if q["id"] == row["question_id"]), None)
-            row["image_pdf_page"] = (source or {}).get("image_pdf_page") or (
-                question_image_page(db, source["stem"], source.get("chunk_id")) if source else None)
+        source = next((q for q in paper.snapshot if q["id"] == row["question_id"]), None)
+        image_page = question_image_page(db, source["stem"], source.get("chunk_id")) if source else None
+        if image_page:
+            row["image_pdf_page"], row["image_chunk_id"] = image_page, source.get("chunk_id")
+        else:
+            row.pop("image_pdf_page", None)
+            row.pop("image_chunk_id", None)
     return value
 
 
 @app.get("/api/my/attempts")
-def my_attempts(user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def my_attempts(user: User = Depends(permits("results.view")), db: Session = Depends(get_db)):
     attempts = db.scalars(select(Attempt).where(Attempt.user_id == user.id).order_by(Attempt.id.desc())).all()
     for attempt in attempts:
         paper = db.get(Paper, attempt.paper_id)
@@ -1144,7 +1292,7 @@ def my_attempts(user: User = Depends(roles("student", "admin")), db: Session = D
 
 
 @app.get("/api/my/mastery")
-def mastery(user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def mastery(user: User = Depends(permits("results.view")), db: Session = Depends(get_db)):
     result = {}
     for attempt in db.scalars(select(Attempt).where(Attempt.user_id == user.id, Attempt.submitted_at.is_not(None))).all():
         for row in attempt.result:
@@ -1156,7 +1304,7 @@ def mastery(user: User = Depends(roles("student", "admin")), db: Session = Depen
 
 
 @app.get("/api/my/variant-requests")
-def variant_requests(user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def variant_requests(user: User = Depends(permits("results.view")), db: Session = Depends(get_db)):
     jobs = db.scalars(select(Job).where(Job.key.like(f"variant:%:{user.id}")).order_by(Job.id.desc())).all()
     result = []
     for job in jobs:
@@ -1174,7 +1322,7 @@ class PracticeInput(BaseModel):
 
 
 @app.post("/api/practices")
-def create_practice(data: PracticeInput, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def create_practice(data: PracticeInput, user: User = Depends(permits("practice.use")), db: Session = Depends(get_db)):
     attempt = require(db.get(Attempt, data.source_attempt_id))
     if attempt.user_id != user.id or not attempt.submitted_at:
         raise HTTPException(403, "只能练习自己的已交卷错题")
@@ -1202,9 +1350,10 @@ def create_practice(data: PracticeInput, user: User = Depends(roles("student", "
     db.add(practice)
     db.commit()
     knowledge = db.get(Knowledge, question.knowledge_id)
+    image_page = question_image_page(db, question.stem, question.chunk_id)
     return {"practice": out(practice), "question": {**question_public(question),
             "book_id": knowledge.book_id if knowledge else None,
-            "image_pdf_page": question_image_page(db, question.stem, question.chunk_id)}}
+            "image_pdf_page": image_page, "image_chunk_id": question.chunk_id if image_page else None}}
 
 
 class PracticeAnswer(BaseModel):
@@ -1212,7 +1361,7 @@ class PracticeAnswer(BaseModel):
 
 
 @app.post("/api/practices/{practice_id}/answer")
-def answer_practice(practice_id: int, data: PracticeAnswer, user: User = Depends(roles("student", "admin")), db: Session = Depends(get_db)):
+def answer_practice(practice_id: int, data: PracticeAnswer, user: User = Depends(permits("practice.use")), db: Session = Depends(get_db)):
     practice = require(db.get(Practice, practice_id))
     if practice.user_id != user.id:
         raise HTTPException(403, "无权访问")
@@ -1227,5 +1376,5 @@ def answer_practice(practice_id: int, data: PracticeAnswer, user: User = Depends
 
 
 @app.get("/api/audits")
-def audits(entity: str, entity_id: int, user: User = Depends(roles("admin")), db: Session = Depends(get_db)):
+def audits(entity: str, entity_id: int, user: User = Depends(permits("audits.view")), db: Session = Depends(get_db)):
     return out(db.scalars(select(Audit).where(Audit.entity == entity, Audit.entity_id == entity_id).order_by(Audit.id.desc())).all())

@@ -1,11 +1,12 @@
 import hashlib
 import re
 
+import pymupdf
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .catalog import chapter_outline, expand_heading_indices, headings_for_chunks, normalized
-from .models import Audit, Chunk, Knowledge, Page, Question
+from .models import Audit, Book, Chunk, Knowledge, Page, Question
 
 
 def audit(db: Session, entity: str, entity_id: int, actor_id: int | None, action: str, before=None, after=None):
@@ -175,13 +176,63 @@ def blocking_question_errors(errors: list[str]) -> list[str]:
     return [error for error in errors if error not in SOURCE_VALIDATION_WARNINGS]
 
 
-def question_image_page(db: Session, stem: str, chunk_id: int | None) -> int | None:
-    """Show the immutable source PDF page when a question refers to a figure."""
-    if not chunk_id or not re.search(r"图\s*\d+(?:[-－—.]\d+)*|下图|上图|如图|图中|图示|插图|图片|示意图|流程图", stem):
+FIGURE_REFERENCE = re.compile(r"图\s*\d+(?:[-－—.]\d+)*|下图|上图|如图|图中|图示|插图|图片|示意图|流程图")
+
+
+def chunk_figure_spec(db: Session, chunk_id: int | None):
+    """Locate one nearby graphical region; never fall back to rendering a full page."""
+    if not chunk_id:
         return None
     chunk = db.get(Chunk, chunk_id)
     page = db.get(Page, chunk.page_id) if chunk else None
-    return page.pdf_page if page else None
+    book = db.get(Book, chunk.book_id) if chunk else None
+    if not page or not book or not isinstance(chunk.bbox, list) or len(chunk.bbox) != 4:
+        return None
+    try:
+        anchor = pymupdf.Rect(*map(float, chunk.bbox))
+        if anchor.is_empty or anchor.is_infinite:
+            return None
+        with pymupdf.open(book.file_path) as document:
+            source = document[page.pdf_page - 1]
+            page_rect = source.rect
+            page_area = page_rect.width * page_rect.height
+            candidates = []
+            for info in source.get_image_info():
+                if info.get("bbox"):
+                    candidates.append(pymupdf.Rect(info["bbox"]))
+            candidates.extend(pymupdf.Rect(item["rect"]) for item in source.get_drawings() if item.get("rect"))
+            usable = []
+            for rect in candidates:
+                rect &= page_rect
+                area = rect.width * rect.height
+                if (rect.width < 35 or rect.height < 28 or area < page_area * .004 or
+                        area > page_area * .72):
+                    continue
+                vertical_gap = max(anchor.y0 - rect.y1, rect.y0 - anchor.y1, 0)
+                horizontal_gap = max(anchor.x0 - rect.x1, rect.x0 - anchor.x1, 0)
+                if vertical_gap > page_rect.height * .42 or horizontal_gap > page_rect.width * .35:
+                    continue
+                usable.append((vertical_gap * 2 + horizontal_gap, -area, rect))
+            if not usable:
+                return None
+            figure = min(usable, key=lambda item: (item[0], item[1]))[2]
+            margin = 7
+            clip = pymupdf.Rect(figure.x0 - margin, figure.y0 - margin,
+                                figure.x1 + margin, figure.y1 + margin) & page_rect
+            if clip.is_empty:
+                return None
+            return {"book_id": book.id, "pdf_page": page.pdf_page,
+                    "clip": [clip.x0, clip.y0, clip.x1, clip.y1]}
+    except (FileNotFoundError, RuntimeError, ValueError, IndexError, pymupdf.FileDataError):
+        return None
+
+
+def question_image_page(db: Session, stem: str, chunk_id: int | None) -> int | None:
+    """Return a page only when a referenced figure can be safely cropped."""
+    if not FIGURE_REFERENCE.search(stem):
+        return None
+    spec = chunk_figure_spec(db, chunk_id)
+    return spec["pdf_page"] if spec else None
 
 
 def question_public(question: Question):

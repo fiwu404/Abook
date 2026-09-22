@@ -12,6 +12,19 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20))
 
 
+class UserPermission(Base):
+    __tablename__ = "user_permissions"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    permission: Mapped[str] = mapped_column(String(80), primary_key=True)
+
+
+class UserSecurity(Base):
+    __tablename__ = "user_security"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class ModelProvider(Base):
     __tablename__ = "model_providers"
     id: Mapped[int] = mapped_column(primary_key=True)
