@@ -44,6 +44,15 @@ class AISettings(Base):
     vision_model: Mapped[str] = mapped_column(String(200), default="")
 
 
+class ProviderCatalog(Base):
+    __tablename__ = "provider_catalog"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_url: Mapped[str] = mapped_column(String(500))
+    entries: Mapped[list] = mapped_column(JSON, default=list)
+    fetched_at: Mapped[object | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
 class Book(Base):
     __tablename__ = "books"
     id: Mapped[int] = mapped_column(primary_key=True)

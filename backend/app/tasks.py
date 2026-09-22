@@ -8,6 +8,7 @@ from .ai import ocr_png, structured, vision_json
 from .catalog import chapter_entries, chapter_for_page, chapter_outline, discover_catalog, headings_for_chunks, normalized
 from .db import SessionLocal
 from .models import Book, BookCatalog, Chunk, Job, Knowledge, Page, Question
+from .provider_catalog import refresh_provider_catalog
 from .services import chapter_question_plan, page_issues, rebuild_chunks, scoped_knowledge_with_headings, validate_question
 
 
@@ -15,6 +16,12 @@ celery_app = Celery("abook", broker=os.getenv("CELERY_BROKER_URL", "redis://redi
 celery_app.conf.update(task_acks_late=True, worker_prefetch_multiplier=1,
                        task_reject_on_worker_lost=True,
                        task_soft_time_limit=3600, task_time_limit=3660)
+celery_app.conf.beat_schedule = {
+    "refresh-model-provider-catalog": {
+        "task": "abook.refresh_provider_catalog",
+        "schedule": 1800.0,
+    },
+}
 
 
 def _check(db, job):
@@ -387,3 +394,9 @@ def run_job(self, job_id: int):
                 raise self.retry(exc=exc, countdown=2 ** (self.request.retries + 1))
             job.status = "failed"
             db.commit()
+
+
+@celery_app.task(name="abook.refresh_provider_catalog")
+def refresh_provider_catalog_task():
+    with SessionLocal() as db:
+        refresh_provider_catalog(db)

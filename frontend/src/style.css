@@ -86,5 +86,6 @@ html,body,#app{height:100%;overflow:hidden}
 .password-reset-section>.muted{margin-bottom:12px}
 .password-reset-section .inline-check{margin-bottom:12px!important}
 .ollama-address-row{display:grid;grid-template-columns:120px minmax(0,1fr) 130px;gap:12px;align-items:end}
+.template-variable-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:15px}
 @media(max-width:560px){.password-change-wrap{padding:16px}.password-change-card{padding:25px}.password-reset-section{padding:14px}}
-@media(max-width:700px){.ollama-address-row{grid-template-columns:1fr}.ollama-address-row label{margin-bottom:0}}
+@media(max-width:700px){.ollama-address-row,.template-variable-grid{grid-template-columns:1fr}.ollama-address-row label{margin-bottom:0}}

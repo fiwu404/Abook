@@ -1,4 +1,16 @@
 services:
+  secret-init:
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -s /run/abook/app_secret ]; then
+          umask 077
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /run/abook/app_secret
+        fi
+    volumes:
+      - app_secret:/run/abook
   mysql:
     image: mysql:8.4
     environment:
@@ -25,23 +37,22 @@ services:
     environment: &backend_env
       DATABASE_URL: mysql+pymysql://abook:${MYSQL_PASSWORD:-abook_dev_password}@mysql:3306/abook?charset=utf8mb4
       CELERY_BROKER_URL: redis://redis:6379/0
-      APP_SECRET: ${APP_SECRET:-change-this-secret-before-deploying-1234567890}
+      APP_SECRET: ${APP_SECRET:-}
+      APP_SECRET_FILE: /run/abook/app_secret
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin12345678}
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
-      MODEL_API_KEY: ${MODEL_API_KEY:-ollama}
-      MODEL_REASONING_EFFORT: ${MODEL_REASONING_EFFORT:-none}
-      TEXT_MODEL: ${TEXT_MODEL:-qwen3-vl:8b}
-      OCR_MODEL: ${OCR_MODEL:-qwen3-vl:4b}
+      PROVIDER_CATALOG_AUTO_REFRESH: "1"
       UPLOAD_DIR: /app/data/uploads
       CORS_ORIGINS: http://localhost:5173
     volumes:
       - uploads:/app/data/uploads
+      - app_secret:/run/abook:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     depends_on:
+      secret-init: { condition: service_completed_successfully }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
   worker:
@@ -50,9 +61,21 @@ services:
     environment: *backend_env
     volumes:
       - uploads:/app/data/uploads
+      - app_secret:/run/abook:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
+      secret-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  beat:
+    build: ./backend
+    command: celery -A app.tasks.celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    environment: *backend_env
+    volumes:
+      - app_secret:/run/abook:ro
+    depends_on:
+      secret-init: { condition: service_completed_successfully }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
   frontend:
@@ -64,3 +87,4 @@ services:
 volumes:
   mysql_data:
   uploads:
+  app_secret:

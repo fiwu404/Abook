@@ -2,7 +2,6 @@
 import base64
 import hashlib
 import json
-import os
 import time
 from urllib.parse import urlsplit
 
@@ -10,8 +9,9 @@ import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
 
+from .config import app_secret
 from .db import SessionLocal
-from .models import AISettings, ModelProvider
+from .models import AISettings, Audit, ModelProvider
 
 
 def validate_base_url(value: str) -> str:
@@ -21,14 +21,14 @@ def validate_base_url(value: str) -> str:
         parsed.port
     except ValueError as exc:
         raise ValueError("模型地址格式无效") from exc
-    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or
+    if ("{" in url or "}" in url or parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or
             parsed.password or parsed.query or parsed.fragment or url.endswith("/chat/completions")):
-        raise ValueError("模型地址须为 http(s) API 根地址，例如 https://api.example.com/v1")
+        raise ValueError("模型地址须为已填写完整变量的 http(s) API 根地址，例如 https://api.example.com/v1")
     return url
 
 
 def _fernet() -> Fernet:
-    secret = os.environ["APP_SECRET"].encode()
+    secret = app_secret().encode()
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret).digest()))
 
 
@@ -45,23 +45,28 @@ def decrypt_key(provider: ModelProvider) -> str:
         raise RuntimeError("提供商密钥无法解密，请重新填写；APP_SECRET 可能已更换") from exc
 
 
-def seed_ai_settings(db) -> None:
+def initialize_ai_settings(db) -> None:
     settings = db.get(AISettings, 1)
-    if settings:
+    if not settings:
+        db.add(AISettings(id=1, text_provider_id=None, text_model="",
+                          vision_provider_id=None, vision_model=""))
+        db.commit()
         return
-    base_url = validate_base_url(os.getenv("MODEL_BASE_URL") or "http://host.docker.internal:11434/v1")
-    api_style = "ollama" if urlsplit(base_url).port == 11434 else "openai"
-    name = "本机 Ollama" if api_style == "ollama" else "默认云端模型"
-    provider = db.scalar(select(ModelProvider).where(ModelProvider.display_name == name))
-    if not provider:
-        key = os.getenv("MODEL_API_KEY", "")
-        provider = ModelProvider(display_name=name, base_url=base_url, api_style=api_style,
-                                 api_key_cipher=encrypt_key(key) if api_style == "openai" and key else None)
-        db.add(provider)
+    provider = db.get(ModelProvider, settings.text_provider_id) if settings.text_provider_id else None
+    legacy_seed = (
+        provider
+        and settings.text_provider_id == settings.vision_provider_id
+        and provider.display_name in {"本机 Ollama", "默认云端模型"}
+        and (settings.text_model, settings.vision_model) == ("qwen3-vl:8b", "qwen3-vl:4b")
+        and not db.scalar(select(Audit.id).where(Audit.entity == "ai_config", Audit.entity_id == 1))
+        and not db.scalar(select(Audit.id).where(Audit.entity == "provider", Audit.entity_id == provider.id))
+    )
+    if legacy_seed:
+        settings.text_provider_id = settings.vision_provider_id = None
+        settings.text_model = settings.vision_model = ""
         db.flush()
-    db.add(AISettings(id=1, text_provider_id=provider.id, text_model=os.getenv("TEXT_MODEL") or "qwen3-vl:8b",
-                      vision_provider_id=provider.id, vision_model=os.getenv("OCR_MODEL") or "qwen3-vl:4b"))
-    db.commit()
+        db.delete(provider)
+        db.commit()
 
 
 def provider_view(provider: ModelProvider) -> dict:
@@ -90,7 +95,8 @@ def list_models(provider: ModelProvider) -> list[str]:
     else:
         url = base + "/models"
         key = decrypt_key(provider)
-        headers = {"Authorization": "Bearer " + key} if key else {}
+        headers = ({"x-api-key": key, "anthropic-version": "2023-06-01"} if provider.api_style == "anthropic"
+                   else {"Authorization": "Bearer " + key} if key else {})
     with _client(20) as client:
         response = client.get(url, headers=headers)
         response.raise_for_status()
@@ -109,20 +115,51 @@ def test_connection(provider: ModelProvider) -> dict:
             "models": models, "model_count": len(models)}
 
 
+def _anthropic_content(content):
+    if isinstance(content, str):
+        return content
+    converted = []
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            converted.append({"type": "text", "text": str(part.get("text", ""))})
+        elif part.get("type") == "image_url":
+            url = str((part.get("image_url") or {}).get("url", ""))
+            if url.startswith("data:") and ";base64," in url:
+                header, data = url.split(",", 1)
+                converted.append({"type": "image", "source": {
+                    "type": "base64", "media_type": header[5:].split(";", 1)[0], "data": data}})
+            elif url:
+                converted.append({"type": "image", "source": {"type": "url", "url": url}})
+    return converted
+
+
+def _anthropic_payload(model: str, messages: list[dict]) -> dict:
+    system = "\n".join(str(item.get("content", "")) for item in messages if item.get("role") == "system")
+    converted = [{"role": item.get("role", "user"), "content": _anthropic_content(item.get("content", ""))}
+                 for item in messages if item.get("role") in {"user", "assistant"}]
+    payload = {"model": model, "max_tokens": 4096, "messages": converted}
+    if system:
+        payload["system"] = system
+    return payload
+
+
 def _request(provider: ModelProvider, model: str, messages: list[dict], json_mode: bool = False,
              timeout: float = 300) -> str:
     if not model:
         raise RuntimeError("尚未选择模型")
     base = validate_base_url(provider.base_url)
     key = decrypt_key(provider)
-    headers = {"Authorization": "Bearer " + key} if key else {}
-    payload = {"model": model, "messages": messages}
-    if provider.api_style == "ollama" and os.getenv("MODEL_REASONING_EFFORT"):
-        payload["reasoning_effort"] = os.environ["MODEL_REASONING_EFFORT"]
-    if json_mode:
+    anthropic = provider.api_style == "anthropic"
+    headers = ({"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+               if anthropic else {"Authorization": "Bearer " + key} if key else {})
+    payload = _anthropic_payload(model, messages) if anthropic else {"model": model, "messages": messages}
+    if json_mode and not anthropic:
         payload["response_format"] = {"type": "json_object"}
     with _client(timeout) as client:
-        response = client.post(base + "/chat/completions", headers=headers, json=payload)
+        response = client.post(base + ("/messages" if anthropic else "/chat/completions"),
+                               headers=headers, json=payload)
         # Ollama may return 500 when its JSON grammar parser rejects a vision
         # model's OCR-style reply. Retry once without the forced format.
         if json_mode and (response.status_code in {400, 422} or
@@ -135,7 +172,8 @@ def _request(provider: ModelProvider, model: str, messages: list[dict], json_mod
             except (ValueError, AttributeError):
                 detail = response.text
             raise RuntimeError(f"{provider.display_name} / {model} 返回 HTTP {response.status_code}：{str(detail)[:400]}")
-        message = response.json()["choices"][0]["message"]
+        body = response.json()
+        message = body if anthropic else body["choices"][0]["message"]
     content = message.get("content") or message.get("reasoning") or message.get("thinking")
     if isinstance(content, list):
         content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
@@ -162,6 +200,9 @@ def _json_object(raw: str) -> dict:
 
 
 def _selected(kind: str) -> tuple[ModelProvider, str]:
+    # Deliberately query the single settings row for every AI call. Provider
+    # and model changes made in the admin page therefore take effect without
+    # restarting the API or Celery worker.
     with SessionLocal() as db:
         settings = db.get(AISettings, 1)
         provider_id = getattr(settings, f"{kind}_provider_id", None) if settings else None

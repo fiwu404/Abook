@@ -18,30 +18,39 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .ai import (config_view, encrypt_key, list_models, provider_view, seed_ai_settings,
+from .ai import (config_view, encrypt_key, initialize_ai_settings, list_models, provider_view,
                  test_connection, test_model, validate_base_url)
 from .catalog import chapter_entries, chapter_for_page, parse_manual_toc, parse_page_spec, validate_toc
+from .config import app_secret
 from .db import Base, SessionLocal, engine, get_db, now
 from .models import AISettings, Attempt, Audit, Book, BookCatalog, Chunk, Job, JobDismissal, Knowledge, ModelProvider, Page, Paper, Practice, Question, User
+from .provider_catalog import (initialize_provider_catalog, provider_catalog_view,
+                               refresh_provider_catalog)
 from .security import (PERMISSION_CATALOG, ROLE_DEFAULTS, bootstrap, check_password, current_user,
                        hash_password, has_permission, initialize_permissions, issue_token, permits,
                        set_user_permissions, user_permissions, user_security)
 from .services import (audit, blocking_question_errors, chunk_figure_spec, page_issues,
                        question_image_page, question_public, question_snapshot, rebuild_chunks,
                        scoped_knowledge, validate_question)
-from .tasks import run_job
+from .tasks import refresh_provider_catalog_task, run_job
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if len(os.getenv("APP_SECRET", "")) < 32:
-        raise RuntimeError("APP_SECRET 至少需要 32 个字符")
+    if len(app_secret()) < 32:
+        raise RuntimeError("应用密钥至少需要 32 个字符")
     Path(os.getenv("UPLOAD_DIR", "./data/uploads")).mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         bootstrap(db)
         initialize_permissions(db)
-        seed_ai_settings(db)
+        initialize_ai_settings(db)
+        catalog = initialize_provider_catalog(db)
+        if not catalog.entries and os.getenv("PROVIDER_CATALOG_AUTO_REFRESH") == "1":
+            try:
+                refresh_provider_catalog_task.delay()
+            except Exception:
+                pass
     yield
 
 
@@ -301,8 +310,8 @@ class ProviderConnectionInput(BaseModel):
 
 
 def provider_base_url(base_url: str, api_style: str):
-    if api_style not in {"ollama", "openai"}:
-        raise HTTPException(400, "接口类型仅支持 Ollama 或 OpenAI 兼容")
+    if api_style not in {"ollama", "openai", "anthropic"}:
+        raise HTTPException(400, "接口类型仅支持 Ollama、OpenAI 兼容或 Anthropic")
     try:
         base_url = validate_base_url(base_url)
     except ValueError as exc:
@@ -321,6 +330,19 @@ def provider_data(data: ProviderInput):
 @app.get("/api/providers")
 def providers(user: User = Depends(permits("models.view")), db: Session = Depends(get_db)):
     return [provider_view(p) for p in db.scalars(select(ModelProvider).order_by(ModelProvider.id)).all()]
+
+
+@app.get("/api/provider-catalog")
+def get_provider_catalog(user: User = Depends(permits("models.view")), db: Session = Depends(get_db)):
+    return provider_catalog_view(initialize_provider_catalog(db))
+
+
+@app.post("/api/provider-catalog/refresh")
+def update_provider_catalog(user: User = Depends(permits("models.manage")), db: Session = Depends(get_db)):
+    try:
+        return provider_catalog_view(refresh_provider_catalog(db))
+    except Exception as exc:
+        raise HTTPException(502, f"供应商目录更新失败：{str(exc)[:300]}") from exc
 
 
 @app.post("/api/providers/test-connection")

@@ -10,11 +10,12 @@ from fastapi import Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .config import app_secret
 from .db import get_db
 from .models import User, UserPermission, UserSecurity
 
 
-SECRET = os.getenv("APP_SECRET", "")
+SECRET = app_secret()
 
 PERMISSION_CATALOG = [
     {"code": "books.view", "group": "教材", "name": "查看教材与学习内容", "description": "查看已建立索引的教材、章节和结构化学习页"},

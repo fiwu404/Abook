@@ -19,8 +19,10 @@ const providers = ref<any[]>([])
 const aiConfig = ref<any>({ text_provider_id: null, text_model: '', vision_provider_id: null, vision_model: '' })
 const providerModels = ref<Record<number, string[]>>({})
 const providerLoading = ref<Record<number, boolean>>({})
-const newProvider = ref({ display_name: '', base_url: '', api_style: 'openai', api_key: '',
-  ollama_scheme: 'http', ollama_host: 'host.docker.internal', ollama_port: 11434 })
+const providerCatalog = ref<any>({ entries: [], fetched_at: null, error: '', source_url: '' })
+const newProvider = ref<any>({ display_name: '', base_url: '', api_style: 'openai', api_key: '',
+  ollama_scheme: 'http', ollama_host: 'host.docker.internal', ollama_port: 11434,
+  catalog_name: '', template_values: {} })
 const editingProviderId = ref<number | null>(null)
 const providerConnectionTest = ref<any>(null)
 const modelTest = ref<Record<string, any>>({})
@@ -110,6 +112,18 @@ const permissionGroups = computed(() => permissionCatalog.value.reduce((groups: 
   ;(groups[item.group] ||= []).push(item)
   return groups
 }, {}))
+const selectedProviderTemplate = computed(() => (providerCatalog.value.entries || [])
+  .find((item: any) => item.name === newProvider.value.catalog_name) || null)
+const selectedProviderUrlTemplate = computed(() => {
+  const entry = selectedProviderTemplate.value
+  if (!entry || newProvider.value.api_style === 'ollama') return ''
+  return entry[newProvider.value.api_style === 'anthropic' ? 'url_anthropic' : 'url_openai'] || 'none'
+})
+const providerTemplateVariables = computed<string[]>(() => {
+  const template = selectedProviderUrlTemplate.value
+  return template && !['input', 'none'].includes(template)
+    ? [...new Set([...template.matchAll(/\{([^{}]+)\}/g)].map(match => match[1]))] : []
+})
 const chapterOutline = computed<any[]>(() => {
   const toc = catalog.value?.toc || []
   const roots = new Set((catalog.value?.chapters || []).map((item: any) => item.title))
@@ -207,8 +221,9 @@ async function refresh() {
     [accounts.value, permissionCatalog.value] = await Promise.all([api('/users'), api('/permissions')])
   } else { accounts.value = []; permissionCatalog.value = [] }
   if (canViewModels.value) {
-    [aiStatus.value, providers.value, aiConfig.value] = await Promise.all([api('/ai/status'), api('/providers'), api('/ai/config')])
-  } else { aiStatus.value = null; providers.value = [] }
+    [aiStatus.value, providers.value, aiConfig.value, providerCatalog.value] = await Promise.all([
+      api('/ai/status'), api('/providers'), api('/ai/config'), api('/provider-catalog')])
+  } else { aiStatus.value = null; providers.value = []; providerCatalog.value = { entries: [], fetched_at: null, error: '', source_url: '' } }
   if (canResults.value) {
     const [a, m, v] = await Promise.all([api('/my/attempts'), api('/my/mastery'), api('/my/variant-requests')])
     attempts.value = a; mastery.value = m; variantRequests.value = v
@@ -354,17 +369,62 @@ function resetProviderForm() {
   editingProviderId.value = null
   providerConnectionTest.value = null
   newProvider.value = { display_name: '', base_url: '', api_style: 'openai', api_key: '',
-    ollama_scheme: 'http', ollama_host: 'host.docker.internal', ollama_port: 11434 }
+    ollama_scheme: 'http', ollama_host: 'host.docker.internal', ollama_port: 11434,
+    catalog_name: '', template_values: {} }
 }
 function providerBaseUrl() {
-  if (newProvider.value.api_style !== 'ollama') return newProvider.value.base_url.trim()
-  const host = newProvider.value.ollama_host.trim()
-  const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
-  return `${newProvider.value.ollama_scheme}://${formattedHost}:${newProvider.value.ollama_port}/v1`
+  if (newProvider.value.api_style === 'ollama') {
+    const host = newProvider.value.ollama_host.trim()
+    const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+    return `${newProvider.value.ollama_scheme}://${formattedHost}:${newProvider.value.ollama_port}/v1`
+  }
+  const template = selectedProviderUrlTemplate.value
+  if (!template || template === 'input') return newProvider.value.base_url.trim()
+  if (template === 'none') return ''
+  return template.replace(/\{([^{}]+)\}/g, (_match: string, name: string) =>
+    String(newProvider.value.template_values[name] || '').trim() || `{${name}}`)
 }
 function providerPayload() {
+  if (selectedProviderUrlTemplate.value === 'none') throw new Error('该供应商没有当前接口格式')
+  for (const name of providerTemplateVariables.value) {
+    const value = String(newProvider.value.template_values[name] || '').trim()
+    if (!value) throw new Error(`请填写变量 ${name}`)
+    if (!/^[A-Za-z0-9._~-]+$/.test(value)) throw new Error(`变量 ${name} 只能包含字母、数字、点、下划线和连字符`)
+  }
   return { display_name: newProvider.value.display_name.trim(), base_url: providerBaseUrl(),
     api_style: newProvider.value.api_style, api_key: newProvider.value.api_key }
+}
+function chooseProviderTemplate() {
+  const entry = selectedProviderTemplate.value
+  providerConnectionTest.value = null
+  newProvider.value.template_values = {}
+  if (!entry) { newProvider.value.base_url = ''; return }
+  newProvider.value.display_name = entry.name
+  newProvider.value.api_style = entry.preferred_style || (entry.url_openai !== 'none' ? 'openai' : 'anthropic')
+  const template = entry[newProvider.value.api_style === 'openai' ? 'url_openai' : 'url_anthropic']
+  newProvider.value.base_url = template === 'input' ? '' : template
+}
+function chooseProviderStyle() {
+  if (newProvider.value.api_style === 'ollama') {
+    newProvider.value.catalog_name = ''
+    newProvider.value.template_values = {}
+    return
+  }
+  const template = selectedProviderUrlTemplate.value
+  if (selectedProviderTemplate.value && template === 'none') {
+    newProvider.value.api_style = selectedProviderTemplate.value.url_openai !== 'none' ? 'openai' : 'anthropic'
+  }
+  newProvider.value.template_values = {}
+  const selected = selectedProviderUrlTemplate.value
+  newProvider.value.base_url = selected && !['input', 'none'].includes(selected) ? selected : ''
+}
+async function refreshProviderCatalog(force = false) {
+  try {
+    const value = force
+      ? await act(() => api('/provider-catalog/refresh', 'POST'), '供应商目录已更新')
+      : await api('/provider-catalog')
+    if (value) providerCatalog.value = value
+  } catch (e: any) { error.value = e.message || String(e) }
 }
 async function testProviderConnection() {
   if (newProvider.value.api_style === 'ollama' &&
@@ -373,7 +433,9 @@ async function testProviderConnection() {
     return
   }
   providerConnectionTest.value = null
-  const payload = providerPayload()
+  let payload
+  try { payload = providerPayload() }
+  catch (e: any) { error.value = e.message || String(e); return }
   const result = await act(() => api('/providers/test-connection', 'POST', {
     base_url: payload.base_url, api_style: payload.api_style, api_key: payload.api_key,
   }), '提供商连接测试成功')
@@ -382,13 +444,17 @@ async function testProviderConnection() {
 watch(newProvider, () => { providerConnectionTest.value = null }, { deep: true })
 watch(tab, value => {
   if (value !== 'models') return
+  refreshProviderCatalog()
   for (const id of new Set([aiConfig.value.text_provider_id, aiConfig.value.vision_provider_id])) {
     if (id && !providerModels.value[id]) loadProviderModels(id)
   }
 })
 async function saveProvider() {
   const id = editingProviderId.value
-  const saved = await act(() => api(id ? `/providers/${id}` : '/providers', id ? 'PUT' : 'POST', providerPayload()), '提供商已保存')
+  let payload
+  try { payload = providerPayload() }
+  catch (e: any) { error.value = e.message || String(e); return }
+  const saved = await act(() => api(id ? `/providers/${id}` : '/providers', id ? 'PUT' : 'POST', payload), '提供商已保存')
   if (saved) {
     providers.value = await api('/providers')
     resetProviderForm()
@@ -398,7 +464,8 @@ function editProvider(provider: any) {
   editingProviderId.value = provider.id
   const next = { display_name: provider.display_name, base_url: provider.base_url,
     api_style: provider.api_style, api_key: '', ollama_scheme: 'http',
-    ollama_host: 'host.docker.internal', ollama_port: 11434 }
+    ollama_host: 'host.docker.internal', ollama_port: 11434,
+    catalog_name: '', template_values: {} }
   if (provider.api_style === 'ollama') {
     try {
       const parsed = new URL(provider.base_url)
@@ -617,11 +684,13 @@ function tick() {
 }
 let interval: ReturnType<typeof setInterval> | undefined
 let examPolls = 0
+let providerCatalogPolls = 0
 onMounted(async () => {
   if (token) { try { user.value = await api('/auth/me'); if (!user.value.must_change_password) await refresh() } catch { setToken('') } }
   interval = setInterval(() => {
     tick()
     if (currentAttempt.value && ++examPolls % 3 === 0) syncCurrentAttempt()
+    if (user.value && canViewModels.value && ++providerCatalogPolls % 60 === 0) refreshProviderCatalog()
     if (user.value && canViewJobs.value) api('/jobs').then(data => {
       const finished = data.some((job: any) => ['done', 'failed', 'cancelled'].includes(job.status) &&
         jobs.value.some(old => old.id === job.id && ['queued', 'running', 'retrying'].includes(old.status)))
@@ -721,7 +790,9 @@ onUnmounted(() => { if (interval) clearInterval(interval); clearSourceImages() }
         </section>
 
         <section v-if="tab === 'models' && canViewModels">
-          <div class="page-head"><div><p class="eyebrow">MODEL PROVIDERS</p><h1>模型接入</h1><p>连接本机、局域网或远程 Ollama，也可使用 OpenAI 兼容提供商，并分别配置文本与视觉 OCR 模型。</p></div></div>
+          <div class="page-head"><div><p class="eyebrow">MODEL PROVIDERS</p><h1>模型接入</h1><p>供应商模板由远程目录定时更新；同时支持 Ollama、OpenAI 兼容与 Anthropic 接口。</p></div><button v-if="canManageModels" class="secondary" :disabled="busy" @click="refreshProviderCatalog(true)">立即更新供应商目录</button></div>
+          <div v-if="providerCatalog.error" class="alert error">目录更新失败，继续使用上次成功数据：{{ providerCatalog.error }}</div>
+          <div v-else class="source-line"><span>供应商目录 {{ providerCatalog.entries?.length || 0 }} 项</span><span>最近更新：{{ providerCatalog.fetched_at ? time(providerCatalog.fetched_at) : '等待首次更新' }}</span></div>
           <div v-if="!canManageModels" class="panel"><h2>当前模型（只读）</h2><div class="source-line"><span>文本：{{ aiStatus?.text?.provider || '未设置' }} / {{ aiStatus?.text?.model || '未设置' }}</span><span>视觉 OCR：{{ aiStatus?.vision?.provider || '未设置' }} / {{ aiStatus?.vision?.model || '未设置' }}</span></div></div><div v-if="canManageModels" class="two-col"><div class="panel form-panel"><h2>当前模型</h2>
             <div v-for="kind in (['text', 'vision'] as const)" :key="kind" class="model-config">
               <h3>{{ kind === 'text' ? '知识点与试题生成' : '扫描页视觉 OCR' }}</h3>
@@ -732,19 +803,24 @@ onUnmounted(() => { if (interval) clearInterval(interval); clearSourceImages() }
             </div>
             <button class="primary" :disabled="busy || !aiConfig.text_model || !aiConfig.vision_model" @click="saveAiConfig">保存模型选择并启用</button>
             <p class="muted">测试可用性只检查连接；需要保存后，解析和出题任务才会使用所选模型。当前启用：文本 {{ aiStatus?.text?.provider || '未设置' }} / {{ aiStatus?.text?.model || '未设置' }}，视觉 {{ aiStatus?.vision?.provider || '未设置' }} / {{ aiStatus?.vision?.model || '未设置' }}。</p>
-          </div><div class="panel form-panel"><h2>{{ editingProviderId ? '编辑提供商' : '添加提供商' }}</h2><p class="muted">Ollama 可部署在本机、局域网或远程服务器；云端需提供 OpenAI 兼容的 /models 和 /chat/completions 接口。密钥保存后不再显示。</p>
+          </div><div class="panel form-panel"><h2>{{ editingProviderId ? '编辑提供商' : '添加提供商' }}</h2><p class="muted">选择供应商模板后优先使用 OpenAI 格式；只有 Anthropic 格式时会自动切换。input 需要自行填写地址，none 表示不提供该接口。</p>
             <label>显示名称<input v-model="newProvider.display_name" placeholder="如：云端 VL" /></label>
-            <label>接口类型<select v-model="newProvider.api_style"><option value="openai">OpenAI 兼容</option><option value="ollama">Ollama</option></select></label>
+            <label>供应商模板<select v-model="newProvider.catalog_name" @change="chooseProviderTemplate"><option value="">自定义</option><option v-for="entry in providerCatalog.entries || []" :key="entry.name" :value="entry.name">{{ entry.name }}</option></select></label>
+            <label>接口类型<select v-model="newProvider.api_style" @change="chooseProviderStyle"><option value="openai" :disabled="!!selectedProviderTemplate && selectedProviderTemplate.url_openai === 'none'">OpenAI 兼容</option><option value="anthropic" :disabled="!!selectedProviderTemplate && selectedProviderTemplate.url_anthropic === 'none'">Anthropic</option><option value="ollama">Ollama 原生模型列表 + OpenAI 对话</option></select></label>
             <template v-if="newProvider.api_style === 'ollama'">
               <div class="ollama-address-row"><label>协议<select v-model="newProvider.ollama_scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label><label>Ollama 主机地址<input v-model.trim="newProvider.ollama_host" placeholder="如：192.168.1.20 或 ollama.example.com" /></label><label>端口<input v-model.number="newProvider.ollama_port" type="number" min="1" max="65535" placeholder="11434" /></label></div>
               <p class="muted">后端运行在容器中时，宿主机 Ollama 请填 host.docker.internal；其他设备填写其 IP 或域名。当前连接：{{ providerBaseUrl() }}</p>
             </template>
-            <label v-else>API 根地址<input v-model="newProvider.base_url" placeholder="https://api.example.com/v1" /></label>
+            <template v-else>
+              <div v-if="providerTemplateVariables.length" class="template-variable-grid"><label v-for="name in providerTemplateVariables" :key="name">变量 {{ name }}<input v-model.trim="newProvider.template_values[name]" :placeholder="`填写 ${name}`" /></label></div>
+              <label v-if="!selectedProviderTemplate || selectedProviderUrlTemplate === 'input'">API 根地址<input v-model="newProvider.base_url" placeholder="https://api.example.com/v1" /></label>
+              <label v-else>解析后的 API 根地址<input :value="providerBaseUrl()" readonly /></label>
+            </template>
             <label>API 密钥<input v-model="newProvider.api_key" type="password" autocomplete="new-password" :placeholder="editingProviderId ? '留空则保留原密钥' : 'Ollama 可留空'" /></label>
-            <div class="button-row"><button class="secondary" :disabled="busy || (newProvider.api_style === 'ollama' ? !newProvider.ollama_host || !newProvider.ollama_port : !newProvider.base_url)" @click="testProviderConnection">测试连接</button><button class="primary" :disabled="busy || !newProvider.display_name || (newProvider.api_style === 'ollama' ? !newProvider.ollama_host || !newProvider.ollama_port : !newProvider.base_url)" @click="saveProvider">保存提供商</button><button v-if="editingProviderId" class="secondary" @click="resetProviderForm">取消编辑</button></div>
+            <div class="button-row"><button class="secondary" :disabled="busy || !providerBaseUrl()" @click="testProviderConnection">测试连接</button><button class="primary" :disabled="busy || !newProvider.display_name || !providerBaseUrl()" @click="saveProvider">保存提供商</button><button v-if="editingProviderId" class="secondary" @click="resetProviderForm">取消编辑</button></div>
             <p v-if="providerConnectionTest" class="model-ok">连接成功 · {{ providerConnectionTest.latency_ms }} ms · 找到 {{ providerConnectionTest.model_count }} 个模型<span v-if="providerConnectionTest.models?.length">：{{ providerConnectionTest.models.slice(0, 8).join('、') }}{{ providerConnectionTest.models.length > 8 ? '…' : '' }}</span></p>
           </div></div>
-          <div class="panel"><div class="panel-head"><h2>提供商列表</h2><span>{{ providers.length }} 个</span></div><div v-for="provider in providers" :key="provider.id" class="model-provider-row"><div><strong>{{ provider.display_name }}</strong><p class="muted">{{ provider.api_style === 'ollama' ? 'Ollama' : 'OpenAI 兼容' }} · {{ provider.base_url }} · {{ provider.has_api_key ? '已设置密钥' : '未设置密钥' }}</p></div><div class="button-row"><button class="small" @click="loadProviderModels(provider.id)">查询模型</button><button v-if="canManageModels" class="text-btn" @click="editProvider(provider)">编辑</button></div></div></div>
+          <div class="panel"><div class="panel-head"><h2>提供商列表</h2><span>{{ providers.length }} 个</span></div><div v-for="provider in providers" :key="provider.id" class="model-provider-row"><div><strong>{{ provider.display_name }}</strong><p class="muted">{{ provider.api_style === 'ollama' ? 'Ollama' : provider.api_style === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容' }} · {{ provider.base_url }} · {{ provider.has_api_key ? '已设置密钥' : '未设置密钥' }}</p></div><div class="button-row"><button class="small" @click="loadProviderModels(provider.id)">查询模型</button><button v-if="canManageModels" class="text-btn" @click="editProvider(provider)">编辑</button></div></div></div>
         </section>
 
         <section v-if="tab === 'users' && canViewUsers">

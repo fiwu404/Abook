@@ -18,12 +18,14 @@ os.environ["UPLOAD_DIR"] = str(Path(tmp.name) / "uploads")
 os.environ["APP_SECRET"] = "test-secret-abcdefghijklmnopqrstuvwxyz-12345"
 os.environ["ADMIN_PASSWORD"] = "admin12345678"
 
-from app.db import SessionLocal, now  # noqa: E402
+from app.db import Base, SessionLocal, engine, now  # noqa: E402
 from app.main import app, enqueue  # noqa: E402
 from app.tasks import _knowledge_batches, _source_weight, _verbatim_quote, celery_app  # noqa: E402
 from app import ai  # noqa: E402
 from app.catalog import chapter_entries, expand_heading_indices, parse_toc_text  # noqa: E402
-from app.models import BookCatalog, Job, JobDismissal, ModelProvider, Page, Paper  # noqa: E402
+from app.config import app_secret  # noqa: E402
+from app.models import AISettings, BookCatalog, Job, JobDismissal, ModelProvider, Page, Paper  # noqa: E402
+from app.provider_catalog import parse_provider_catalog, refresh_provider_catalog  # noqa: E402
 
 
 celery_app.conf.task_always_eager = True
@@ -38,6 +40,71 @@ def ok(response, code=200):
 def headers(client, username, password):
     token = ok(client.post("/api/auth/login", json={"username": username, "password": password}))["token"]
     return {"Authorization": "Bearer " + token}
+
+
+def test_app_secret_prefers_existing_env_and_supports_generated_file(monkeypatch, tmp_path):
+    generated = tmp_path / "app_secret"
+    generated.write_text("f" * 64, encoding="utf-8")
+    monkeypatch.delenv("APP_SECRET")
+    monkeypatch.setenv("APP_SECRET_FILE", str(generated))
+    assert app_secret() == "f" * 64
+    monkeypatch.setenv("APP_SECRET", "e" * 64)
+    assert app_secret() == "e" * 64
+
+
+def test_initial_model_configuration_is_empty():
+    with TestClient(app) as client:
+        admin = headers(client, "admin", "admin12345678")
+        assert ok(client.get("/api/ai/config", headers=admin)) == {
+            "text_provider_id": None, "text_model": "",
+            "vision_provider_id": None, "vision_model": ""}
+        assert ok(client.get("/api/providers", headers=admin)) == []
+    with SessionLocal() as db:
+        legacy = ModelProvider(display_name="本机 Ollama",
+                               base_url="http://host.docker.internal:11434/v1", api_style="ollama")
+        db.add(legacy)
+        db.flush()
+        settings = db.get(AISettings, 1)
+        settings.text_provider_id = settings.vision_provider_id = legacy.id
+        settings.text_model, settings.vision_model = "qwen3-vl:8b", "qwen3-vl:4b"
+        db.commit()
+        ai.initialize_ai_settings(db)
+        assert db.get(AISettings, 1).text_provider_id is None
+        assert db.get(ModelProvider, legacy.id) is None
+
+
+def test_provider_catalog_parses_formats_inputs_and_variables():
+    parsed = parse_provider_catalog([
+        {"name": "Dual", "url_openai": "https://open.example/v1",
+         "url_anthropic": "https://anthropic.example/v1"},
+        {"name": "Variable", "url_openai": "https://{tenant}.example/{ACCOUNT_ID}/v1",
+         "url_anthropic": "none"},
+        {"name": "Manual", "url_openai": "input", "url_anthropic": "none"},
+        {"name": "Anthropic only", "url_openai": "none",
+         "url_anthropic": "https://api.anthropic.com/v1"},
+        {"name": "Unavailable", "url_openai": "none", "url_anthropic": "none"},
+    ])
+    assert [item["name"] for item in parsed] == ["Dual", "Variable", "Manual", "Anthropic only"]
+    assert parsed[0]["preferred_style"] == "openai"
+    assert parsed[1]["variables"] == ["ACCOUNT_ID", "tenant"]
+    assert parsed[2]["url_openai"] == "input"
+    assert parsed[3]["preferred_style"] == "anthropic"
+
+
+def test_provider_catalog_refresh_is_stored_in_database():
+    Base.metadata.create_all(engine)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://update.fiwu.cc/modlist"
+        return httpx.Response(200, json=[{
+            "name": "Stored Cloud", "url_openai": "https://stored.example/v1",
+            "url_anthropic": "none"}])
+
+    factory = lambda: httpx.Client(transport=httpx.MockTransport(respond), timeout=20)
+    with SessionLocal() as db:
+        catalog = refresh_provider_catalog(db, factory)
+        assert catalog.entries[0]["name"] == "Stored Cloud"
+        assert catalog.fetched_at is not None and catalog.error == ""
 
 
 def test_detailed_knowledge_batches_keep_heading_and_source():
@@ -259,6 +326,38 @@ def test_cloud_provider_models_selection_and_vision(monkeypatch):
         assert ai.structured("test") == {"ok": True}
         assert ai.ocr_png(b"png") == "TEST 123"
         assert any(b"image_url" in request.content for request in requests)
+
+
+def test_anthropic_provider_models_and_message_format(monkeypatch):
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers.get("x-api-key") == "anthropic-test-key"
+        assert request.headers.get("anthropic-version") == "2023-06-01"
+        if request.method == "GET":
+            assert request.url.path == "/v1/models"
+            return httpx.Response(200, json={"data": [{"id": "claude-test"}]})
+        assert request.url.path == "/v1/messages"
+        payload = json.loads(request.content)
+        assert payload["model"] == "claude-test" and "response_format" not in payload
+        assert payload["system"] == "Return JSON"
+        image = payload["messages"][0]["content"][1]
+        assert image["type"] == "image" and image["source"]["type"] == "base64"
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "{\"ok\":true}"}]})
+
+    monkeypatch.setattr(ai, "_client",
+                        lambda timeout: httpx.Client(transport=httpx.MockTransport(respond), timeout=timeout))
+    provider = ModelProvider(display_name="Anthropic Test", base_url="https://api.anthropic.test/v1",
+                             api_style="anthropic", api_key_cipher=ai.encrypt_key("anthropic-test-key"))
+    assert ai.list_models(provider) == ["claude-test"]
+    result = ai._request(provider, "claude-test", [
+        {"role": "system", "content": "Return JSON"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Read"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}}]}],
+        json_mode=True)
+    assert result == '{"ok":true}' and len(requests) == 2
 
 
 def test_remote_ollama_address_port_and_connection_test(monkeypatch):
